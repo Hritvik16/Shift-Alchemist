@@ -1,0 +1,7 @@
+node_modules/
+dist/
+public/
+*.bin
+*.png
+*.jpg
+package-lock.json

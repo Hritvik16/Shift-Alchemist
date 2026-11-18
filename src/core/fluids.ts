@@ -1,7 +1,8 @@
-// Strictly Mass-Conserving 3D Voxel Fluid Stencil (0.0 - 1.0L Volume Contract)
-// - Non-destructive 6-neighbor Cryo + Water -> Ice phase transition (top-down, bottom-up & side-by-side)
-// - 1G Ledge Suction Gradient for catwalk waterfalls
-// - 0G Surface-Tension Cohesion
+// Strictly Mass-Conserving 3D Voxel Fluid & Ice Stencil (0.0 - 1.0L Contract)
+// - 0G Mid-Air Suspension Band (y = 4..7) + Whole-Cell Transport + 5x5x5 Cohesive Merging
+// - Strict MIN_FLUID_VOL (0.05L) on both source & target cells (zero orphan slivers or thin films)
+// - 1G Gravity for unsupported ICE blocks
+// - 6-neighbor Cryo + Water -> Ice phase transition
 
 import {
   MAX_CELL_VOLUME,
@@ -13,7 +14,7 @@ import {
 import type { RoomGrid, GlassVatTank } from './types';
 import { setVoxel, recountActiveCells } from './roomGen';
 
-const MIN_FLUID_VOL = 0.02;
+export const MIN_FLUID_VOL = 0.05;
 
 const STENCIL_6 = [
   [1, 0, 0],
@@ -60,9 +61,9 @@ export function shatterCylindricalVat(room: RoomGrid, vat: GlassVatTank): void {
       z,
       vat.fluidMat,
       volPerVoxel,
-      dx * 3.2,
-      room.gravityG === 0 ? 1.6 : 0.5,
-      dz * 3.2 + (y >= 7 ? 2.8 : 0)
+      dx * 2.8,
+      room.gravityG === 0 ? 0.4 : 0.5,
+      dz * 2.8 + (y >= 7 ? 2.8 : 0)
     );
   }
 
@@ -74,6 +75,9 @@ export function shatterCylindricalVat(room: RoomGrid, vat: GlassVatTank): void {
   recountActiveCells(room);
 }
 
+/**
+ * Gives floor puddles a controlled lift impulse toward the mid-air suspension band (y = 4..7)
+ */
 export function applyZeroGLiftImpulseToGrid(room: RoomGrid): void {
   const { width, height, depth, matGrid, vyGrid } = room;
   for (let y = 1; y < height - 1; y++) {
@@ -82,7 +86,14 @@ export function applyZeroGLiftImpulseToGrid(room: RoomGrid): void {
         const idx = getVoxelIndex(room, x, y, z);
         const mat = matGrid[idx] as MaterialID;
         if (!isFluidMaterial(mat)) continue;
-        vyGrid[idx] = 2.8 + ((x * 7 + z * 13) % 5) * 0.35;
+        // Lift low puddles upward toward y = 5..6, and gently pull high ceiling cells downward
+        if (y <= 3) {
+          vyGrid[idx] = 1.6 + ((x + z) % 3) * 0.25;
+        } else if (y >= 8) {
+          vyGrid[idx] = -1.2;
+        } else {
+          vyGrid[idx] = 0.3;
+        }
       }
     }
   }
@@ -90,9 +101,7 @@ export function applyZeroGLiftImpulseToGrid(room: RoomGrid): void {
 }
 
 /**
- * Non-destructive Cryo + Water -> Ice Phase Transition:
- * Freezes the Water cell in-place into MaterialID.ICE while preserving its exact volGrid[waterIdx]
- * and keeping Cryo's volume 100% intact (zero mass created or destroyed!).
+ * Non-destructive Cryo + Water -> Ice Phase Transition
  */
 function tryFreezeCryoWaterContact(
   room: RoomGrid,
@@ -114,11 +123,13 @@ function tryFreezeCryoWaterContact(
     return false;
   }
 
-  if (room.volGrid[waterIdx] < MIN_FLUID_VOL || room.volGrid[cryoIdx] < MIN_FLUID_VOL) {
+  if (
+    room.volGrid[waterIdx] < MIN_FLUID_VOL ||
+    room.volGrid[cryoIdx] < MIN_FLUID_VOL
+  ) {
     return false;
   }
 
-  // Convert the Water cell in-place to solid Ice, keeping its exact volume in volGrid!
   room.matGrid[waterIdx] = MaterialID.ICE;
   room.tempGrid[waterIdx] = -10;
   room.vxGrid[waterIdx] = 0;
@@ -132,13 +143,15 @@ function tryFreezeCryoWaterContact(
 }
 
 /**
- * 100% Mass-Conserving Fluid Transfer (strictly respects MAX_CELL_VOLUME = 1.0)
+ * 100% Mass-Conserving Fluid Transfer:
+ * Enforces MIN_FLUID_VOL on BOTH the source remainder AND any newly created target cell!
  */
 function transferFluidVolume(
   room: RoomGrid,
   fromIdx: number,
   toIdx: number,
-  requestedAmount: number
+  requestedAmount: number,
+  minNewTargetVol = MIN_FLUID_VOL
 ): boolean {
   if (fromIdx === toIdx) return false;
   const mat = room.matGrid[fromIdx] as MaterialID;
@@ -161,11 +174,26 @@ function transferFluidVolume(
 
   let actual = Math.min(fromVol, requestedAmount, availSpace);
 
-  // Never leave a sub-threshold sliver behind: either move 100% of fromVol or hold intact
+  // 1. Prevent leaving a sub-minimum sliver in the source cell
   if (fromVol - actual < MIN_FLUID_VOL) {
     if (availSpace >= fromVol) {
       actual = fromVol;
-    } else if (actual < MIN_FLUID_VOL) {
+    } else {
+      // Cannot move whole cell and cannot leave a sliver < MIN_FLUID_VOL
+      const maxAllowed = fromVol - MIN_FLUID_VOL;
+      if (maxAllowed >= MIN_FLUID_VOL) {
+        actual = Math.min(actual, maxAllowed);
+      } else {
+        return false;
+      }
+    }
+  }
+
+  // 2. Prevent creating a new target cell in AIR with volume below minNewTargetVol
+  if (toMat === MaterialID.AIR && actual < minNewTargetVol) {
+    if (fromVol >= minNewTargetVol && availSpace >= fromVol) {
+      actual = fromVol; // Move whole droplet intact instead of creating a tiny fragment
+    } else {
       return false;
     }
   }
@@ -216,15 +244,62 @@ function isOpenLedgeDropOff(
 
 /**
  * Pure 3D Cellular Stencil Step (20 Hz):
- * - 100% Mass-Conserving within [0.0, 1.0] per cell
- * - 6-neighbor Cryo + Water freezing (vertical & horizontal)
- * - 1G Ledge Suction Waterfalls & Archimedes Density Stratification
- * - 0G Surface-Tension Cohesive Clustering
+ * - 1G Gravity for unsupported ICE blocks (no floating ice platforms in 1G)
+ * - 0G Mid-Air Suspension Band (y = 4..7) + Whole-Cell Transport + 5x5x5 Cohesive Merging
+ * - 1G Puddle Thickness Enforcement (prevents thin-film over-spreading)
  */
 export function step3DFluidStencil(room: RoomGrid, dt: number): void {
   const { width, height, depth, matGrid, volGrid, vxGrid, vyGrid, vzGrid } = room;
   let changed = false;
 
+  // 0. Step 1G Gravity for unsupported ICE blocks first (bottom-up so falling columns drop cleanly)
+  if (room.gravityG > 0) {
+    for (let y = 2; y < height - 1; y++) {
+      for (let z = 1; z < depth - 1; z++) {
+        for (let x = 1; x < width - 1; x++) {
+          const idx = getVoxelIndex(room, x, y, z);
+          if ((matGrid[idx] as MaterialID) !== MaterialID.ICE) continue;
+
+          const belowIdx = getVoxelIndex(room, x, y - 1, z);
+          const belowMat = matGrid[belowIdx] as MaterialID;
+
+          if (belowMat === MaterialID.AIR) {
+            // Move unsupported ICE block straight down into AIR
+            matGrid[belowIdx] = MaterialID.ICE;
+            volGrid[belowIdx] = volGrid[idx];
+            room.tempGrid[belowIdx] = room.tempGrid[idx];
+            room.voltGrid[belowIdx] = room.voltGrid[idx];
+
+            matGrid[idx] = MaterialID.AIR;
+            volGrid[idx] = 0.0;
+            room.dirtyStaticRender = true;
+            changed = true;
+          } else if (isFluidMaterial(belowMat)) {
+            // Ice sinks into underlying liquid pool (swap ICE with fluid below)
+            const fMat = matGrid[belowIdx];
+            const fVol = volGrid[belowIdx];
+            const fTemp = room.tempGrid[belowIdx];
+            const fVolt = room.voltGrid[belowIdx];
+
+            matGrid[belowIdx] = MaterialID.ICE;
+            volGrid[belowIdx] = volGrid[idx];
+            room.tempGrid[belowIdx] = room.tempGrid[idx];
+            room.voltGrid[belowIdx] = room.voltGrid[idx];
+
+            matGrid[idx] = fMat;
+            volGrid[idx] = fVol;
+            room.tempGrid[idx] = fTemp;
+            room.voltGrid[idx] = fVolt;
+            room.dirtyStaticRender = true;
+            room.dirtyFluidRender = true;
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Collect active fluid cells
   const activeIndices: number[] = [];
   for (let y = 1; y < height - 1; y++) {
     for (let z = 1; z < depth - 1; z++) {
@@ -237,7 +312,10 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
     }
   }
 
-  if (activeIndices.length === 0) return;
+  if (activeIndices.length === 0) {
+    if (changed) recountActiveCells(room);
+    return;
+  }
 
   for (let i = 0; i < activeIndices.length; i++) {
     const idx = activeIndices[i];
@@ -252,7 +330,7 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
     const y = Math.floor(idx / (width * depth));
     const props = MATERIAL_TABLE[mat];
 
-    // 0. Check 6-Neighbor Cryo + Water Contact FIRST (handles top-down, bottom-up, and side-by-side!)
+    // 1. Check 6-Neighbor Cryo + Water Contact (top-down, bottom-up, and side-by-side)
     if (mat === MaterialID.CRYO || mat === MaterialID.WATER) {
       let froze = false;
       for (const [dx, dy, dz] of STENCIL_6) {
@@ -270,22 +348,21 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       if (froze && (matGrid[idx] as MaterialID) === MaterialID.ICE) continue;
     }
 
-    // 1. 1G Vertical Free-Fall & Archimedes Density Stratification
+    // 2. 1G Vertical Free-Fall & Archimedes Density Stratification
     if (room.gravityG > 0 && y > 1) {
       const belowIdx = getVoxelIndex(room, x, y - 1, z);
       const belowMat = matGrid[belowIdx] as MaterialID;
 
       if (belowMat === MaterialID.AIR || belowMat === mat) {
         vyGrid[idx] = Math.min(-3.5, vyGrid[idx] - 18.0 * dt);
-        const dropFraction = vol > 0.45 ? 0.8 : 1.0;
-        if (transferFluidVolume(room, idx, belowIdx, vol * dropFraction)) {
+        // Move 100% of falling cell volume when possible so no mid-air orphan slivers remain
+        if (transferFluidVolume(room, idx, belowIdx, vol, MIN_FLUID_VOL)) {
           changed = true;
           if (matGrid[idx] === MaterialID.AIR) continue;
           vol = volGrid[idx];
         }
       } else if (isFluidMaterial(belowMat)) {
         const belowProps = MATERIAL_TABLE[belowMat];
-        // Archimedes Buoyancy: Denser Water (1.0) sinks underneath lighter Oil (0.82)
         if (props.density > belowProps.density + 0.05) {
           const tempMat = matGrid[belowIdx];
           const tempVol = volGrid[belowIdx];
@@ -305,7 +382,7 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
           continue;
         }
       } else if (MATERIAL_TABLE[belowMat].isSolid && vyGrid[idx] < -1.5) {
-        const splashSpeed = Math.min(4.5, Math.abs(vyGrid[idx]) * 0.45);
+        const splashSpeed = Math.min(4.0, Math.abs(vyGrid[idx]) * 0.4);
         const angle = ((x * 17 + z * 31) % 8) * (Math.PI / 4);
         vxGrid[idx] += Math.cos(angle) * splashSpeed;
         vzGrid[idx] += Math.sin(angle) * splashSpeed;
@@ -313,15 +390,16 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       }
     }
 
-    // 2. Compute 3D Surface Tension / Cohesion Gradient & 1G Ledge Suction Gradient
+    // 3. Compute 5x5x5 Cohesive Attraction Gradient (wider range re-merges separated 0G droplets!)
     let cohX = 0;
     let cohY = 0;
     let cohZ = 0;
     let sameNeighborCount = 0;
+    const radiusScan = room.gravityG === 0 ? 2 : 1;
 
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -radiusScan; dy <= radiusScan; dy++) {
+      for (let dz = -radiusScan; dz <= radiusScan; dz++) {
+        for (let dx = -radiusScan; dx <= radiusScan; dx++) {
           if (dx === 0 && dy === 0 && dz === 0) continue;
           const nx = x + dx;
           const ny = y + dy;
@@ -330,10 +408,12 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
           const nIdx = getVoxelIndex(room, nx, ny, nz);
           if (matGrid[nIdx] === mat) {
             const nVol = volGrid[nIdx];
-            cohX += dx * nVol;
-            cohY += dy * nVol;
-            cohZ += dz * nVol;
-            sameNeighborCount++;
+            const dist = Math.hypot(dx, dy, dz);
+            const weight = nVol / dist;
+            cohX += (dx / dist) * weight;
+            cohY += (dy / dist) * weight;
+            cohZ += (dz / dist) * weight;
+            if (dist <= 1.8) sameNeighborCount++;
           }
         }
       }
@@ -348,7 +428,7 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
           const lz = z + dz * dist;
           if (lx <= 0 || lx >= width - 1 || lz <= 0 || lz >= depth - 1) break;
           if (isOpenLedgeDropOff(room, lx, y, lz)) {
-            const weight = 3.2 / dist;
+            const weight = 3.5 / dist;
             ledgePullX += dx * weight;
             ledgePullZ += dz * weight;
             break;
@@ -359,25 +439,32 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       vxGrid[idx] += ledgePullX * dt * 8.0;
       vzGrid[idx] += ledgePullZ * dt * 8.0;
 
-      const damp = Math.max(0.25, 1.0 - (1.4 + props.viscosity * 3.5) * dt);
+      const damp = Math.max(0.25, 1.0 - (1.6 + props.viscosity * 3.5) * dt);
       vxGrid[idx] *= damp;
       vzGrid[idx] *= damp;
     } else {
-      const pullStrength = props.surfaceTension * 4.2;
+      // 0G Mid-Air Suspension Band (y = 4..7 -> 2.0m..3.5m altitude):
+      // Gentle restoring force keeps floating clusters suspended in mid-air instead of hitting y=9..10 ceiling!
+      const pullStrength = props.surfaceTension * 5.0;
       vxGrid[idx] += cohX * pullStrength * dt;
       vyGrid[idx] += cohY * pullStrength * dt;
       vzGrid[idx] += cohZ * pullStrength * dt;
 
-      if (y <= 2 && vyGrid[idx] < 0) vyGrid[idx] = -vyGrid[idx] * 0.6 + 0.8;
-      if (y >= height - 2 && vyGrid[idx] > 0) vyGrid[idx] = -vyGrid[idx] * 0.6;
+      const targetMidAirY = 5.5;
+      const altError = targetMidAirY - y;
+      vyGrid[idx] += altError * 1.8 * dt;
 
-      const damp0G = Math.max(0.4, 1.0 - 1.5 * dt);
+      // Strong ceiling/floor repulsion outside y in [3..7]
+      if (y <= 3 && vyGrid[idx] < 0) vyGrid[idx] = Math.max(0.6, -vyGrid[idx] * 0.5);
+      if (y >= 8 && vyGrid[idx] > 0) vyGrid[idx] = Math.min(-0.8, -vyGrid[idx] * 0.5);
+
+      const damp0G = Math.max(0.3, 1.0 - 3.2 * dt);
       vxGrid[idx] *= damp0G;
       vyGrid[idx] *= damp0G;
       vzGrid[idx] *= damp0G;
     }
 
-    // 3. 1G Hydrostatic Spreading & Ledge Waterfall Spillover
+    // 4. 1G Hydrostatic Spreading (with strict minPuddleHeight so puddles don't over-spread into thin films!)
     if (room.gravityG > 0) {
       let spilledOverLedge = false;
       for (const [dx, dz] of HORIZ_4) {
@@ -389,7 +476,8 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
           vxGrid[idx] = dx * 2.2;
           vzGrid[idx] = dz * 2.2;
           vyGrid[idx] = -3.0;
-          if (transferFluidVolume(room, idx, nIdx, vol * 0.85)) {
+          // Move 100% of edge cell over the waterfall lip
+          if (transferFluidVolume(room, idx, nIdx, vol, MIN_FLUID_VOL)) {
             changed = true;
             spilledOverLedge = true;
             break;
@@ -399,14 +487,13 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       if (spilledOverLedge && matGrid[idx] === MaterialID.AIR) continue;
       vol = volGrid[idx];
 
-      const minPuddleHeight = 0.08 + props.viscosity * 0.32;
+      // Natural puddle thickness threshold (Water ~0.16L, Oil ~0.28L, Cryo ~0.13L)
+      const minPuddleHeight = 0.12 + props.viscosity * 0.38;
       const horizSpeed = Math.hypot(vxGrid[idx], vzGrid[idx]);
 
-      if (vol > minPuddleHeight || horizSpeed > 0.6) {
-        const flowRate = Math.min(
-          0.75,
-          (1.0 - props.viscosity * 1.3) * 0.38 + horizSpeed * 0.12
-        );
+      if (vol > minPuddleHeight * 1.35 || horizSpeed > 1.2) {
+        const excess = Math.max(0, vol - minPuddleHeight);
+        const desiredTransfer = Math.max(excess * 0.55, vol * 0.35);
         const startD = (x + z + y) & 3;
 
         let bestDir = -1;
@@ -422,15 +509,21 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
             (mat === MaterialID.CRYO && nMat === MaterialID.WATER) ||
             (mat === MaterialID.WATER && nMat === MaterialID.CRYO);
 
-          if (
-            nMat === MaterialID.AIR ||
-            (nMat === mat && vol > volGrid[nIdx] + 0.03 && volGrid[nIdx] < MAX_CELL_VOLUME) ||
-            isCryoWaterPair
-          ) {
+          // Only spread into AIR if we have enough volume to form a proper puddle cell (>= minPuddleHeight)!
+          const canSpreadToAir =
+            nMat === MaterialID.AIR &&
+            desiredTransfer >= minPuddleHeight &&
+            vol - desiredTransfer >= minPuddleHeight;
+          const canLevelSameFluid =
+            nMat === mat &&
+            vol > volGrid[nIdx] + 0.04 &&
+            volGrid[nIdx] < MAX_CELL_VOLUME;
+
+          if (canSpreadToAir || canLevelSameFluid || isCryoWaterPair) {
             const dot =
               dx * vxGrid[idx] +
               dz * vzGrid[idx] +
-              (nMat === MaterialID.AIR || isCryoWaterPair ? 0.5 : 0);
+              (canSpreadToAir || isCryoWaterPair ? 0.4 : 0);
             if (dot > bestDot) {
               bestDot = dot;
               bestDir = (startD + d) & 3;
@@ -441,32 +534,102 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
         if (bestDir >= 0) {
           const [dx, dz] = HORIZ_4[bestDir];
           const nIdx = getVoxelIndex(room, x + dx, y, z + dz);
-          if (transferFluidVolume(room, idx, nIdx, vol * flowRate)) {
+          const nMat = matGrid[nIdx] as MaterialID;
+          const minTarget = nMat === MaterialID.AIR ? minPuddleHeight : MIN_FLUID_VOL;
+          if (transferFluidVolume(room, idx, nIdx, desiredTransfer, minTarget)) {
             changed = true;
             if (matGrid[idx] === MaterialID.AIR) continue;
             vol = volGrid[idx];
           }
         }
+      } else if (vol < minPuddleHeight && sameNeighborCount > 0) {
+        // Surface tension retracts thin puddle fringes (< minPuddleHeight) back into adjacent pool cells!
+        for (const [dx, dz] of HORIZ_4) {
+          const nx = x + dx;
+          const nz = z + dz;
+          if (!inRoomBounds(room, nx, y, nz)) continue;
+          const nIdx = getVoxelIndex(room, nx, y, nz);
+          if (
+            matGrid[nIdx] === mat &&
+            volGrid[nIdx] >= vol &&
+            volGrid[nIdx] + vol <= MAX_CELL_VOLUME
+          ) {
+            if (transferFluidVolume(room, idx, nIdx, vol, MIN_FLUID_VOL)) {
+              changed = true;
+              break;
+            }
+          }
+        }
       }
     } else {
-      // 4. 0G Advection & Surface-Tension Compaction
+      // 5. 0G Whole-Cell Advection & 26-Neighbor Cohesive Compaction (Zero Orphan Splits!)
       const vx = vxGrid[idx];
       const vy = vyGrid[idx];
       const vz = vzGrid[idx];
       const speed = Math.hypot(vx, vy, vz);
 
-      if (speed > 0.4) {
+      // First try 26-neighbor (3x3x3) cohesive merging into the fullest nearby same-fluid cell
+      let bestMergeIdx = -1;
+      let bestMergeVol = vol;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0 && dz === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            const nz = z + dz;
+            if (
+              nx <= 0 ||
+              nx >= width - 1 ||
+              ny <= 2 ||
+              ny >= height - 2 ||
+              nz <= 0 ||
+              nz >= depth - 1
+            ) {
+              continue;
+            }
+            const nIdx = getVoxelIndex(room, nx, ny, nz);
+            if (
+              matGrid[nIdx] === mat &&
+              volGrid[nIdx] >= bestMergeVol &&
+              volGrid[nIdx] < MAX_CELL_VOLUME
+            ) {
+              bestMergeVol = volGrid[nIdx];
+              bestMergeIdx = nIdx;
+            }
+          }
+        }
+      }
+
+      if (bestMergeIdx >= 0 && vol < MAX_CELL_VOLUME) {
+        // Transfer up to 100% of vol into the fuller neighbor so droplets coalesce cleanly!
+        if (transferFluidVolume(room, idx, bestMergeIdx, vol, MIN_FLUID_VOL)) {
+          changed = true;
+          if (matGrid[idx] === MaterialID.AIR) continue;
+          vol = volGrid[idx];
+        }
+      }
+
+      // Second: Whole-Cell 0G Advection along velocity/cohesion vector (moves 100% of cell, never 85%!)
+      if (speed > 0.55) {
         const stepX =
           Math.abs(vx) >= Math.abs(vy) && Math.abs(vx) >= Math.abs(vz) ? Math.sign(vx) : 0;
         const stepY =
           Math.abs(vy) > Math.abs(vx) && Math.abs(vy) >= Math.abs(vz) ? Math.sign(vy) : 0;
         const stepZ = stepX === 0 && stepY === 0 ? Math.sign(vz) : 0;
 
+        // Clamp 0G vertical movement inside mid-air suspension zone [3 .. height - 4] (y = 3..8)
         const nx = x + stepX;
-        const ny = Math.max(2, Math.min(height - 2, y + stepY));
+        const ny = Math.max(3, Math.min(height - 4, y + stepY));
         const nz = z + stepZ;
 
-        if (nx > 0 && nx < width - 1 && nz > 0 && nz < depth - 1) {
+        if (
+          (nx !== x || ny !== y || nz !== z) &&
+          nx > 0 &&
+          nx < width - 1 &&
+          nz > 0 &&
+          nz < depth - 1
+        ) {
           const targetIdx = getVoxelIndex(room, nx, ny, nz);
           const targetMat = matGrid[targetIdx] as MaterialID;
 
@@ -474,39 +637,15 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
             if (stepX !== 0) vxGrid[idx] = -vx * 0.45;
             if (stepY !== 0) vyGrid[idx] = -vy * 0.45;
             if (stepZ !== 0) vzGrid[idx] = -vz * 0.45;
-          } else if (targetMat === mat || speed > 1.6 || sameNeighborCount <= 2) {
-            const frac = Math.min(0.85, speed * 0.25);
-            if (transferFluidVolume(room, idx, targetIdx, vol * frac)) {
+          } else if (
+            targetMat === mat ||
+            (targetMat === MaterialID.AIR && (speed > 1.2 || sameNeighborCount === 0))
+          ) {
+            // Move 100% of `vol` so moving into AIR never leaves a 15% orphan fragment behind!
+            if (transferFluidVolume(room, idx, targetIdx, vol, vol)) {
               changed = true;
-              if (matGrid[idx] === MaterialID.AIR) continue;
-              vol = volGrid[idx];
             }
           }
-        }
-      }
-
-      // 0G Cohesive Compaction within MAX_CELL_VOLUME = 1.0
-      let bestNeighborIdx = -1;
-      let bestNeighborVol = vol;
-      for (const [dx, dy, dz] of STENCIL_6) {
-        const nx = x + dx;
-        const ny = y + dy;
-        const nz = z + dz;
-        if (nx <= 0 || nx >= width - 1 || ny <= 1 || ny >= height - 1 || nz <= 0 || nz >= depth - 1)
-          continue;
-        const nIdx = getVoxelIndex(room, nx, ny, nz);
-        if (
-          matGrid[nIdx] === mat &&
-          volGrid[nIdx] >= bestNeighborVol &&
-          volGrid[nIdx] < MAX_CELL_VOLUME
-        ) {
-          bestNeighborVol = volGrid[nIdx];
-          bestNeighborIdx = nIdx;
-        }
-      }
-      if (bestNeighborIdx >= 0 && vol < MAX_CELL_VOLUME) {
-        if (transferFluidVolume(room, idx, bestNeighborIdx, vol * 0.65)) {
-          changed = true;
         }
       }
     }

@@ -1,4 +1,7 @@
-// Three.js Renderer (Zero GPU Leaks, Centered Shadow Frustum, Blur Key Reset & Full Mass HUD)
+// Three.js Renderer:
+// - Continuous Flat-Topped 1G Puddle Surface Renderer (Zero bubble/grape-cluster look!)
+// - 3D Sphere Renderer for 0G Floating Clusters & 1G Falling Waterfall Streams
+// - Right-click carving a Glass Vat breaches & shatters the tank
 
 import * as THREE from 'three';
 import {
@@ -17,6 +20,7 @@ import type {
   GlassVatTank,
 } from '../core/types';
 import { setVoxel, recountActiveCells, spawnDynamicEntity } from '../core/roomGen';
+import { shatterCylindricalVat } from '../core/fluids';
 import {
   raycastVoxelGrid,
   stepWorldPhysics,
@@ -81,7 +85,9 @@ export class Scene3DViewer {
   private glassBlockMesh!: THREE.InstancedMesh;
   private overhangRecords: OverhangVoxelRecord[] = [];
 
-  private fluidMeshes = new Map<MaterialID, THREE.InstancedMesh>();
+  // Separate 1G Flat Surface Pool Meshes vs. 0G/Waterfall Sphere Meshes
+  private fluidPoolMeshes = new Map<MaterialID, THREE.InstancedMesh>();
+  private fluidSphereMeshes = new Map<MaterialID, THREE.InstancedMesh>();
   private fluidMaterials = new Map<MaterialID, THREE.Material>();
   private dummy = new THREE.Object3D();
   private colorScratch = new THREE.Color();
@@ -99,7 +105,6 @@ export class Scene3DViewer {
   private vatVisuals = new Map<number, THREE.Group>();
   private entityVisuals = new Map<number, EntityVisualGroup>();
 
-  // Pre-allocated Air Burst LineSegments buffer (Zero per-frame GPU geometry/material leaks!)
   private airBurstMesh!: THREE.LineSegments;
   private airBurstPositions = new Float32Array(32 * 2 * 3);
 
@@ -317,7 +322,6 @@ export class Scene3DViewer {
     this.iceMesh.frustumCulled = false;
     this.scene.add(this.iceMesh);
 
-    // Visible instanced mesh for debug-placed GLASS_VAT blocks
     const glassBlockMat = new THREE.MeshStandardMaterial({
       color: 0xbae6fd,
       emissive: 0x0284c7,
@@ -331,6 +335,14 @@ export class Scene3DViewer {
     this.glassBlockMesh.frustumCulled = false;
     this.scene.add(this.glassBlockMesh);
 
+    // 1. Flat-Topped Liquid Slab Geometry for 1G Surface Puddles (eliminates dome/bubble artifacts!)
+    const flatPoolSlabGeo = new THREE.BoxGeometry(
+      VOXEL_SIZE * 1.02,
+      VOXEL_SIZE,
+      VOXEL_SIZE * 1.02
+    );
+
+    // 2. 3D Sphere Geometry for 0G Floating Clusters & 1G Falling Waterfall Droplets
     const fluidSphereGeo = new THREE.SphereGeometry(VOXEL_SIZE * 0.72, 14, 12);
 
     const waterMat = new THREE.MeshStandardMaterial({
@@ -364,11 +376,19 @@ export class Scene3DViewer {
 
     for (const matId of FLUID_MATERIALS) {
       const mat = this.fluidMaterials.get(matId)!;
-      const mesh = new THREE.InstancedMesh(fluidSphereGeo, mat, 8192);
-      mesh.count = 0;
-      mesh.frustumCulled = false;
-      this.scene.add(mesh);
-      this.fluidMeshes.set(matId, mesh);
+
+      const poolMesh = new THREE.InstancedMesh(flatPoolSlabGeo, mat, 8192);
+      poolMesh.count = 0;
+      poolMesh.frustumCulled = false;
+      poolMesh.receiveShadow = true;
+      this.scene.add(poolMesh);
+      this.fluidPoolMeshes.set(matId, poolMesh);
+
+      const sphereMesh = new THREE.InstancedMesh(fluidSphereGeo, mat, 8192);
+      sphereMesh.count = 0;
+      sphereMesh.frustumCulled = false;
+      this.scene.add(sphereMesh);
+      this.fluidSphereMeshes.set(matId, sphereMesh);
     }
   }
 
@@ -768,7 +788,6 @@ export class Scene3DViewer {
       let glassBlockCount = 0;
       this.overhangRecords = [];
 
-      // Collect voxel indices belonging to intact cylindrical vats so standalone debug glass blocks render
       const cylinderVatVoxels = new Set<number>();
       for (const vat of this.room.vats) {
         for (const vIdx of vat.voxelIndices) {
@@ -902,9 +921,14 @@ export class Scene3DViewer {
       this.updateSurgicalOcclusionInstances();
     }
 
+    // Rebuild 1G Flat Surface Pools vs. 0G/Waterfall Spheres
     if (this.room.dirtyFluidRender) {
-      const fluidCounts = new Map<MaterialID, number>();
-      for (const m of FLUID_MATERIALS) fluidCounts.set(m, 0);
+      const poolCounts = new Map<MaterialID, number>();
+      const sphereCounts = new Map<MaterialID, number>();
+      for (const m of FLUID_MATERIALS) {
+        poolCounts.set(m, 0);
+        sphereCounts.set(m, 0);
+      }
 
       for (let y = 0; y < height; y++) {
         for (let z = 0; z < depth; z++) {
@@ -919,16 +943,16 @@ export class Scene3DViewer {
               continue;
             }
 
-            const mesh = this.fluidMeshes.get(mat)!;
-            const instanceIdx = fluidCounts.get(mat)!;
-            if (instanceIdx >= mesh.instanceMatrix.count) continue;
-
             const vol = volGrid[idx];
+            if (vol <= 0.001) continue;
 
+            // Compute neighbor average volume and metaball shift
             let shiftX = 0;
             let shiftY = 0;
             let shiftZ = 0;
             let neighborWeight = 0;
+            let horizSameSum = vol;
+            let horizSameCount = 1;
 
             for (let dy = -1; dy <= 1; dy++) {
               for (let dz = -1; dz <= 1; dz++) {
@@ -938,22 +962,26 @@ export class Scene3DViewer {
                   const ny = y + dy;
                   const nz = z + dz;
                   if (!inRoomBounds(this.room, nx, ny, nz)) continue;
-                  const nIdx = getVoxelIndex(this.room, nx, ny, nz);
+                  const nIdx = getVoxelIndex(room, nx, ny, nz);
                   if (matGrid[nIdx] === mat) {
                     const w = volGrid[nIdx];
                     shiftX += dx * w;
                     shiftY += dy * w;
                     shiftZ += dz * w;
                     neighborWeight += w;
+                    if (dy === 0) {
+                      horizSameSum += w;
+                      horizSameCount++;
+                    }
                   }
                 }
               }
             }
 
             if (neighborWeight > 0) {
-              shiftX = Math.max(-0.22, Math.min(0.22, (shiftX / neighborWeight) * 0.18));
-              shiftY = Math.max(-0.22, Math.min(0.22, (shiftY / neighborWeight) * 0.18));
-              shiftZ = Math.max(-0.22, Math.min(0.22, (shiftZ / neighborWeight) * 0.18));
+              shiftX = Math.max(-0.2, Math.min(0.2, (shiftX / neighborWeight) * 0.16));
+              shiftY = Math.max(-0.2, Math.min(0.2, (shiftY / neighborWeight) * 0.16));
+              shiftZ = Math.max(-0.2, Math.min(0.2, (shiftZ / neighborWeight) * 0.16));
             }
 
             const belowMat =
@@ -961,50 +989,73 @@ export class Scene3DViewer {
                 ? (matGrid[getVoxelIndex(this.room, x, y - 1, z)] as MaterialID)
                 : MaterialID.HULL_STEEL;
             const restingOnFloorIn1G =
-              this.room.gravityG > 0 && MATERIAL_TABLE[belowMat].isSolid;
+              this.room.gravityG > 0 &&
+              (MATERIAL_TABLE[belowMat].isSolid || belowMat === mat);
 
             if (restingOnFloorIn1G) {
-              const hScale = Math.max(0.18, Math.min(0.75, vol * 0.48));
-              const rScale = Math.max(0.95, Math.min(1.55, 0.9 + vol * 0.55));
-              this.dummy.position.set(
-                (x + 0.5 + shiftX) * VOXEL_SIZE,
-                (y + 0.35 * hScale) * VOXEL_SIZE,
-                (z + 0.5 + shiftZ) * VOXEL_SIZE
-              );
-              this.dummy.scale.set(rScale, hScale, rScale);
-            } else if (this.room.gravityG > 0 && vyGrid[idx] < -0.5) {
-              const wScale = Math.max(0.55, Math.min(1.1, 0.8 * Math.cbrt(vol)));
-              const stretchY = Math.max(1.35, Math.min(2.4, Math.abs(vyGrid[idx]) * 0.42));
-              this.dummy.position.set(
-                (x + 0.5 + vxGrid[idx] * 0.04) * VOXEL_SIZE,
-                (y + 0.5) * VOXEL_SIZE,
-                (z + 0.5 + vzGrid[idx] * 0.04) * VOXEL_SIZE
-              );
-              this.dummy.scale.set(wScale, stretchY, wScale);
-            } else {
-              const sphereScale = Math.max(
-                0.65,
-                Math.min(1.75, 0.9 * Math.cbrt(vol) + Math.min(0.45, neighborWeight * 0.08))
-              );
-              this.dummy.position.set(
-                (x + 0.5 + shiftX) * VOXEL_SIZE,
-                (y + 0.5 + shiftY) * VOXEL_SIZE,
-                (z + 0.5 + shiftZ) * VOXEL_SIZE
-              );
-              this.dummy.scale.set(sphereScale, sphereScale, sphereScale);
-            }
+              // Render as a flat-topped continuous liquid slab (smoothed height across neighbors!)
+              const poolMesh = this.fluidPoolMeshes.get(mat)!;
+              const pIdx = poolCounts.get(mat)!;
+              if (pIdx >= poolMesh.instanceMatrix.count) continue;
 
-            this.dummy.updateMatrix();
-            mesh.setMatrixAt(instanceIdx, this.dummy.matrix);
-            fluidCounts.set(mat, instanceIdx + 1);
+              const avgVol = horizSameSum / horizSameCount;
+              const slabHeight = Math.max(0.12, Math.min(0.85, avgVol * 0.42));
+              // Slight horizontal overlap when surrounded by same fluid so seams vanish completely
+              const widthScale = horizSameCount > 1 ? 1.03 : 0.96;
+
+              this.dummy.position.set(
+                (x + 0.5) * VOXEL_SIZE,
+                (y + 0.5 * slabHeight) * VOXEL_SIZE,
+                (z + 0.5) * VOXEL_SIZE
+              );
+              this.dummy.scale.set(widthScale, slabHeight, widthScale);
+              this.dummy.updateMatrix();
+              poolMesh.setMatrixAt(pIdx, this.dummy.matrix);
+              poolCounts.set(mat, pIdx + 1);
+            } else {
+              // Render airborne 1G waterfalls and 0G floating clusters as smooth 3D spheres/droplets!
+              const sphereMesh = this.fluidSphereMeshes.get(mat)!;
+              const sIdx = sphereCounts.get(mat)!;
+              if (sIdx >= sphereMesh.instanceMatrix.count) continue;
+
+              if (this.room.gravityG > 0 && vyGrid[idx] < -0.5) {
+                const wScale = Math.max(0.55, Math.min(1.05, 0.8 * Math.cbrt(vol)));
+                const stretchY = Math.max(1.35, Math.min(2.3, Math.abs(vyGrid[idx]) * 0.4));
+                this.dummy.position.set(
+                  (x + 0.5 + vxGrid[idx] * 0.04) * VOXEL_SIZE,
+                  (y + 0.5) * VOXEL_SIZE,
+                  (z + 0.5 + vzGrid[idx] * 0.04) * VOXEL_SIZE
+                );
+                this.dummy.scale.set(wScale, stretchY, wScale);
+              } else {
+                const sphereScale = Math.max(
+                  0.65,
+                  Math.min(1.7, 0.9 * Math.cbrt(vol) + Math.min(0.45, neighborWeight * 0.08))
+                );
+                this.dummy.position.set(
+                  (x + 0.5 + shiftX) * VOXEL_SIZE,
+                  (y + 0.5 + shiftY) * VOXEL_SIZE,
+                  (z + 0.5 + shiftZ) * VOXEL_SIZE
+                );
+                this.dummy.scale.set(sphereScale, sphereScale, sphereScale);
+              }
+
+              this.dummy.updateMatrix();
+              sphereMesh.setMatrixAt(sIdx, this.dummy.matrix);
+              sphereCounts.set(mat, sIdx + 1);
+            }
           }
         }
       }
 
       for (const m of FLUID_MATERIALS) {
-        const mesh = this.fluidMeshes.get(m)!;
-        mesh.count = fluidCounts.get(m) || 0;
-        mesh.instanceMatrix.needsUpdate = true;
+        const poolMesh = this.fluidPoolMeshes.get(m)!;
+        poolMesh.count = poolCounts.get(m) || 0;
+        poolMesh.instanceMatrix.needsUpdate = true;
+
+        const sphereMesh = this.fluidSphereMeshes.get(m)!;
+        sphereMesh.count = sphereCounts.get(m) || 0;
+        sphereMesh.instanceMatrix.needsUpdate = true;
       }
 
       this.room.dirtyFluidRender = false;
@@ -1119,7 +1170,6 @@ export class Scene3DViewer {
         (this.placeVoxelCoords.z + 0.5) * VOXEL_SIZE
       );
     } else {
-      // Update aimWorld even when cursor leaves room geometry so stale points never stay locked!
       this.cursorMesh.visible = false;
       this.hoveredVoxel = null;
       this.placeVoxelCoords = null;
@@ -1245,7 +1295,6 @@ export class Scene3DViewer {
     posAttr.needsUpdate = true;
     this.plumbLine.visible = altitude > 0.05 || this.room.gravityG === 0;
 
-    // Sync Cylindrical Glass Vats & dispose removed groups cleanly
     const activeVatIds = new Set<number>();
     for (const vat of this.room.vats) {
       activeVatIds.add(vat.id);
@@ -1261,7 +1310,6 @@ export class Scene3DViewer {
       }
     }
 
-    // Sync Dynamic Entities & dispose removed groups cleanly
     const activeIds = new Set<number>();
     for (const ent of this.room.entities) {
       activeIds.add(ent.id);
@@ -1314,7 +1362,6 @@ export class Scene3DViewer {
       }
     }
 
-    // Dynamic Floor-Aware Plumb-Line for Locked-On Target (pit = 0.5m, deck = 1.5m, catwalk = 4.0m)
     if (this.lockOnTarget) {
       this.lockReticleGroup.visible = true;
       this.lockReticleGroup.position.set(
@@ -1371,7 +1418,6 @@ export class Scene3DViewer {
       this.lockTargetPlumbRing.visible = false;
     }
 
-    // Update Pre-Allocated Air Burst LineSegments Buffer in-place (Zero allocations!)
     const burstCount = Math.min(32, this.room.airBursts.length);
     for (let i = 0; i < burstCount; i++) {
       const b = this.room.airBursts[i];
@@ -1408,8 +1454,19 @@ export class Scene3DViewer {
       this.updateHUD();
     } else if (e.button === 2 && this.hoveredVoxel) {
       const { x, y, z } = this.hoveredVoxel;
-      setVoxel(this.room, x, y, z, MaterialID.AIR, 0.0);
-      recountActiveCells(this.room);
+      const idx = getVoxelIndex(this.room, x, y, z);
+
+      // If carving a voxel belonging to an intact Cylindrical Glass Vat, shatter the vat!
+      const struckVat = this.room.vats.find((v) => v.voxelIndices.includes(idx));
+      if (struckVat) {
+        const matName = MATERIAL_TABLE[struckVat.fluidMat].name;
+        shatterCylindricalVat(this.room, struckVat);
+        this.room.lastCombatLog = `Carved & breached Cylindrical ${matName} Vat — 12.0L released!`;
+      } else {
+        setVoxel(this.room, x, y, z, MaterialID.AIR, 0.0);
+        recountActiveCells(this.room);
+      }
+
       this.rebuildDirtyInstances();
       this.updateHUD();
     }
@@ -1499,8 +1556,8 @@ export class Scene3DViewer {
   private updateHUD(): void {
     const gravLabel =
       this.room.gravityG > 0
-        ? '<span style="color:#4ade80">1G STENCIL POOLS</span>'
-        : '<span style="color:#38bdf8">0G COHESIVE CLUSTERS</span>';
+        ? '<span style="color:#4ade80">1G FLAT POOLS</span>'
+        : '<span style="color:#38bdf8">0G MID-AIR CLUSTERS</span>';
     const lockStr = this.lockOnTarget
       ? `<span style="color:#facc15">LOCKED: ${this.lockOnTarget.label}</span>`
       : '<span style="color:#94a3b8">None (Hover within 14m & Line-of-Sight)</span>';
@@ -1515,12 +1572,12 @@ export class Scene3DViewer {
     )}L | Ice: ${this.room.iceVolume.toFixed(1)}L)`;
 
     this.hudElement.innerHTML = `
-      <div><strong>SHIFT ALCHEMIST — Verified Mass-Conserving 3D Stencil & LOS Sandbox</strong></div>
+      <div><strong>SHIFT ALCHEMIST — Flat 1G Surface Pools, 0G Mid-Air Clusters & Falling Ice</strong></div>
       <div>FPS: <span style="color:#4ade80">${this.fps}</span> | Gravity [Q]: <strong>${gravLabel}</strong> | ${massBreakdown}</div>
       <div>3D Magnetic Lock-On: ${lockStr}</div>
       <div>Combat Log: <span style="color:#fb923c">${this.room.lastCombatLog}</span></div>
       <div style="color:#cbd5e1; font-size:11px; margin-top:3px;">
-        <strong>Test:</strong> Climb West Stairs to Catwalk | Shatter Tank -> 54.00L Total stays invariant across shatters & freezing!<br/>
+        <strong>Test:</strong> [Q] 0G hovers mid-air (y=4..7) with zero orphan splits | Mid-air Ice falls in 1G | R-Click Vat shatters it!<br/>
         <strong>Debug:</strong> [F] Spawn ${matName} [1-6] | [G] Spawn Alien | [R-Click] Carve
       </div>
     `;

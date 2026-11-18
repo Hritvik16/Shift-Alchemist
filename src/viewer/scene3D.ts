@@ -962,7 +962,7 @@ export class Scene3DViewer {
                   const ny = y + dy;
                   const nz = z + dz;
                   if (!inRoomBounds(this.room, nx, ny, nz)) continue;
-                  const nIdx = getVoxelIndex(room, nx, ny, nz);
+                  const nIdx = getVoxelIndex(this.room, nx, ny, nz);
                   if (matGrid[nIdx] === mat) {
                     const w = volGrid[nIdx];
                     shiftX += dx * w;

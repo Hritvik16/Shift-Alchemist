@@ -243,6 +243,73 @@ function isOpenLedgeDropOff(
 }
 
 /**
+ * Looks a few cells along a horizontal direction for an open ledge.
+ * This lets shallow puddle cells on a catwalk/shelf drain toward the edge instead of
+ * being permanently stranded by the minimum-puddle-thickness rule.
+ */
+function hasOpenDropOffAhead(
+  room: RoomGrid,
+  x: number,
+  y: number,
+  z: number,
+  dx: number,
+  dz: number,
+  maxDist = 4
+): boolean {
+  if (y <= 1) return false;
+  for (let dist = 1; dist <= maxDist; dist++) {
+    const nx = x + dx * dist;
+    const nz = z + dz * dist;
+    if (!inRoomBounds(room, nx, y, nz)) return false;
+    const idx = getVoxelIndex(room, nx, y, nz);
+    const mat = room.matGrid[idx] as MaterialID;
+    if (MATERIAL_TABLE[mat].isSolid) return false;
+
+    const belowMat = room.matGrid[
+      getVoxelIndex(room, nx, y - 1, nz)
+    ] as MaterialID;
+    if (!MATERIAL_TABLE[belowMat].isSolid) return true;
+  }
+  return false;
+}
+
+/**
+ * Rejects diagonal 0G merges whose axis-aligned bounding box crosses solid matter.
+ * A 3x3x3 merge must never teleport a droplet through a wall/catwalk corner.
+ */
+function hasClearMergePath(
+  room: RoomGrid,
+  fromIdx: number,
+  toIdx: number
+): boolean {
+  const { width, depth } = room;
+  const fromX = fromIdx % width;
+  const fromZ = Math.floor(fromIdx / width) % depth;
+  const fromY = Math.floor(fromIdx / (width * depth));
+  const toX = toIdx % width;
+  const toZ = Math.floor(toIdx / width) % depth;
+  const toY = Math.floor(toIdx / (width * depth));
+
+  for (let y = Math.min(fromY, toY); y <= Math.max(fromY, toY); y++) {
+    for (let z = Math.min(fromZ, toZ); z <= Math.max(fromZ, toZ); z++) {
+      for (let x = Math.min(fromX, toX); x <= Math.max(fromX, toX); x++) {
+        if (
+          (x === fromX && y === fromY && z === fromZ) ||
+          (x === toX && y === toY && z === toZ)
+        ) {
+          continue;
+        }
+        const idx = getVoxelIndex(room, x, y, z);
+        if (MATERIAL_TABLE[room.matGrid[idx] as MaterialID].isSolid) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+/**
  * Pure 3D Cellular Stencil Step (20 Hz):
  * - 1G Gravity for unsupported ICE blocks (no floating ice platforms in 1G)
  * - 0G Mid-Air Suspension Band (y = 4..7) + Whole-Cell Transport + 5x5x5 Cohesive Merging
@@ -490,8 +557,11 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       // Natural puddle thickness threshold (Water ~0.16L, Oil ~0.28L, Cryo ~0.13L)
       const minPuddleHeight = 0.12 + props.viscosity * 0.38;
       const horizSpeed = Math.hypot(vxGrid[idx], vzGrid[idx]);
+      const nearDropOff = HORIZ_4.some(([dx, dz]) =>
+        hasOpenDropOffAhead(room, x, y, z, dx, dz)
+      );
 
-      if (vol > minPuddleHeight * 1.35 || horizSpeed > 1.2) {
+      if (vol > minPuddleHeight * 1.35 || horizSpeed > 1.2 || nearDropOff) {
         const excess = Math.max(0, vol - minPuddleHeight);
         const desiredTransfer = Math.max(excess * 0.55, vol * 0.35);
         const startD = (x + z + y) & 3;
@@ -505,15 +575,20 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
           if (nx <= 0 || nx >= width - 1 || nz <= 0 || nz >= depth - 1) continue;
           const nIdx = getVoxelIndex(room, nx, y, nz);
           const nMat = matGrid[nIdx] as MaterialID;
+          const dropAhead =
+            nMat === MaterialID.AIR &&
+            hasOpenDropOffAhead(room, x, y, z, dx, dz);
           const isCryoWaterPair =
             (mat === MaterialID.CRYO && nMat === MaterialID.WATER) ||
             (mat === MaterialID.WATER && nMat === MaterialID.CRYO);
 
-          // Only spread into AIR if we have enough volume to form a proper puddle cell (>= minPuddleHeight)!
+          // Normal AIR spreading requires a proper puddle cell; near an open ledge,
+          // allow shallow cells to move so catwalk waterfalls do not strand.
           const canSpreadToAir =
             nMat === MaterialID.AIR &&
-            desiredTransfer >= minPuddleHeight &&
-            vol - desiredTransfer >= minPuddleHeight;
+            (dropAhead ||
+              (desiredTransfer >= minPuddleHeight &&
+                vol - desiredTransfer >= minPuddleHeight));
           const canLevelSameFluid =
             nMat === mat &&
             vol > volGrid[nIdx] + 0.04 &&
@@ -535,14 +610,24 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
           const [dx, dz] = HORIZ_4[bestDir];
           const nIdx = getVoxelIndex(room, x + dx, y, z + dz);
           const nMat = matGrid[nIdx] as MaterialID;
-          const minTarget = nMat === MaterialID.AIR ? minPuddleHeight : MIN_FLUID_VOL;
-          if (transferFluidVolume(room, idx, nIdx, desiredTransfer, minTarget)) {
+          const dropAhead =
+            nMat === MaterialID.AIR &&
+            hasOpenDropOffAhead(room, x, y, z, dx, dz);
+          const minTarget = nMat === MaterialID.AIR
+            ? dropAhead
+              ? MIN_FLUID_VOL
+              : minPuddleHeight
+            : MIN_FLUID_VOL;
+          const transferAmount = dropAhead ? vol : desiredTransfer;
+          if (
+            transferFluidVolume(room, idx, nIdx, transferAmount, minTarget)
+          ) {
             changed = true;
             if (matGrid[idx] === MaterialID.AIR) continue;
             vol = volGrid[idx];
           }
         }
-      } else if (vol < minPuddleHeight && sameNeighborCount > 0) {
+      } else if (vol < minPuddleHeight && sameNeighborCount > 0 && !nearDropOff) {
         // Surface tension retracts thin puddle fringes (< minPuddleHeight) back into adjacent pool cells!
         for (const [dx, dz] of HORIZ_4) {
           const nx = x + dx;
@@ -567,6 +652,26 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       const vy = vyGrid[idx];
       const vz = vzGrid[idx];
       const speed = Math.hypot(vx, vy, vz);
+      // Keep 0G vertical movement inside the advertised mid-air suspension zone
+      // (y = 3..7 for the default 12-voxel-tall room), but only one cell per tick.
+      const maxSuspensionY = Math.max(3, Math.min(height - 4, 7));
+
+      // If a cell escaped above the band (e.g. a shattered high vat), walk it down one
+      // cell per tick. This is deliberately checked before horizontal cohesion so it
+      // cannot stay parked at y=8..10 just because a horizontal velocity is larger.
+      if (y > maxSuspensionY) {
+        const downIdx = getVoxelIndex(room, x, y - 1, z);
+        const downMat = matGrid[downIdx] as MaterialID;
+        if (
+          !MATERIAL_TABLE[downMat].isSolid &&
+          (downMat === mat || downMat === MaterialID.AIR) &&
+          transferFluidVolume(room, idx, downIdx, vol, MIN_FLUID_VOL)
+        ) {
+          changed = true;
+          if (matGrid[idx] === MaterialID.AIR) continue;
+          vol = volGrid[idx];
+        }
+      }
 
       // First try 26-neighbor (3x3x3) cohesive merging into the fullest nearby same-fluid cell
       let bestMergeIdx = -1;
@@ -592,7 +697,8 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
             if (
               matGrid[nIdx] === mat &&
               volGrid[nIdx] >= bestMergeVol &&
-              volGrid[nIdx] < MAX_CELL_VOLUME
+              volGrid[nIdx] < MAX_CELL_VOLUME &&
+              hasClearMergePath(room, idx, nIdx)
             ) {
               bestMergeVol = volGrid[nIdx];
               bestMergeIdx = nIdx;
@@ -611,16 +717,23 @@ export function step3DFluidStencil(room: RoomGrid, dt: number): void {
       }
 
       // Second: Whole-Cell 0G Advection along velocity/cohesion vector (moves 100% of cell, never 85%!)
-      if (speed > 0.55) {
+      // The 5x5x5 cohesion field settles around ~0.4–0.5 speed for separated droplets;
+      // a lower threshold lets them actually approach and merge instead of hovering forever.
+      if (speed > 0.3) {
         const stepX =
           Math.abs(vx) >= Math.abs(vy) && Math.abs(vx) >= Math.abs(vz) ? Math.sign(vx) : 0;
         const stepY =
           Math.abs(vy) > Math.abs(vx) && Math.abs(vy) >= Math.abs(vz) ? Math.sign(vy) : 0;
         const stepZ = stepX === 0 && stepY === 0 ? Math.sign(vz) : 0;
 
-        // Clamp 0G vertical movement inside mid-air suspension zone [3 .. height - 4] (y = 3..8)
+        // Clamp vertical movement to one cell inside the suspension band; clamping
+        // directly to the band would teleport high-up fluid through solid layers.
         const nx = x + stepX;
-        const ny = Math.max(3, Math.min(height - 4, y + stepY));
+        let ny = y;
+        if (stepX === 0 && stepZ === 0) {
+          if (stepY < 0 && y > 3) ny = y - 1;
+          else if (stepY > 0 && y < maxSuspensionY) ny = y + 1;
+        }
         const nz = z + stepZ;
 
         if (

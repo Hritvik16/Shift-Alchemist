@@ -91,8 +91,8 @@ function isOpaqueCode(code: number): boolean {
 
 function codeRGBA(code: number): [number, number, number, number] {
   if (code === 100) return [0.32, 0.38, 0.48, 0.15]; // South/East bulkhead 0.15 opacity (§5)
-  if (code === 101) return [0.48, 0.92, 1.0, 0.42]; // CRYO vat frosted glass
-  if (code === 102) return [0.55, 0.88, 0.82, 0.34]; // Ambient vat glass
+  if (code === 101) return [0.55, 0.96, 1.0, 0.34]; // CRYO vat frosted glass
+  if (code === 102) return [0.65, 0.94, 0.88, 0.28]; // Ambient vat glass
   if (code === MAT.ICE) return [0.6, 0.91, 1.0, 0.78];
 
   const hex = MATERIAL_SPEC[code]?.colorHex ?? 0x808080;

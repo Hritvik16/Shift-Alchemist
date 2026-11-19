@@ -16,12 +16,15 @@ import {
   VOXEL_SIZE_M,
   type MaterialId,
 } from './balance.ts';
+import { reseedActiveLists } from './fluids.ts';
 import { hash32 } from './hash.ts';
 import {
   cellIndex,
   chunkIndex,
   packVoxel,
   recomputeRoomLedgers,
+  recountChunkFluids,
+  resetRoomRuntimeTransient,
   type RoomState,
 } from './types.ts';
 
@@ -35,7 +38,11 @@ function setInitCell(
 ): void {
   const idx = cellIndex(x, y, z);
   const shimmer = mat === MAT.AIR ? 0 : hash32(room.roomSeed, 0, idx) & 7;
-  room.grid[idx] = packVoxel(mat, tempByte, 0, 0, shimmer, 0, 0);
+  const slideDir =
+    mat === MAT.WATER || mat === MAT.OIL || mat === MAT.CRYO || mat === MAT.ACID
+      ? hash32(room.roomSeed, 1, idx) & 3
+      : 0;
+  room.grid[idx] = packVoxel(mat, tempByte, 0, 0, shimmer, slideDir, 0);
 }
 
 function fillBox(
@@ -72,8 +79,8 @@ function buildGlassVatShell(
   const x1 = x0 + w - 1;
   const y1 = y0 + h - 1;
   const z1 = z0 + d - 1;
-  // §7: Only CRYO-filled vats init GLASS_VAT at -196°C; WATER/OIL init at +20°C
   const glassTemp = fluidMat === MAT.CRYO ? TEMP_BYTE.CRYO : TEMP_BYTE.AMBIENT;
+  const fluidTemp = fluidMat === MAT.CRYO ? TEMP_BYTE.CRYO : TEMP_BYTE.AMBIENT;
 
   for (let y = y0; y <= y1; y++) {
     for (let z = z0; z <= z1; z++) {
@@ -83,8 +90,7 @@ function buildGlassVatShell(
         if (isShell) {
           setInitCell(room, x, y, z, MAT.GLASS_VAT, glassTemp);
         } else {
-          // M1.1 keeps shells hollow; M2.1 pre-fills these interior voxels with fluidMat
-          setInitCell(room, x, y, z, MAT.AIR, TEMP_BYTE.AMBIENT);
+          setInitCell(room, x, y, z, fluidMat, fluidTemp);
         }
       }
     }
@@ -100,17 +106,15 @@ function buildGlassVatShell(
     maxX: x1,
     maxY: y1,
     maxZ: z1,
-    centerX: ((x0 + x1 + 1) * 0.5) * VOXEL_SIZE_M,
-    centerY: ((y0 + y1 + 1) * 0.5) * VOXEL_SIZE_M,
-    centerZ: ((z0 + z1 + 1) * 0.5) * VOXEL_SIZE_M,
+    centerX: (x0 + x1 + 1) * 0.5 * VOXEL_SIZE_M,
+    centerY: (y0 + y1 + 1) * 0.5 * VOXEL_SIZE_M,
+    centerZ: (z0 + z1 + 1) * 0.5 * VOXEL_SIZE_M,
     interiorLiters,
   });
 }
 
-/**
- * Generates the canonical 240x64x240 Main Cargo Hold test room (§4.2 & M1.1).
- */
 export function generateCargoHold(room: RoomState, roomSeed: number): void {
+  resetRoomRuntimeTransient(room);
   room.roomSeed = roomSeed >>> 0;
   room.roomW = CARGO_HOLD_DIMS.w;
   room.roomH = CARGO_HOLD_DIMS.h;
@@ -128,29 +132,24 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
     acidConsumed: 0,
   };
 
-  // Clear entire grid to AIR (+20°C)
   room.grid.fill(packVoxel(MAT.AIR, TEMP_BYTE.AMBIENT, 0, 0, 0, 0, 0));
 
   const W = room.roomW;
   const H = room.roomH;
   const D = room.roomD;
 
-  // 1. Sealed outer perimeter faces: BOUNDARY_HULL (ID 12) on all 6 faces
-  fillBox(room, 0, 0, 0, W - 1, 0, D - 1, MAT.BOUNDARY_HULL); // y = 0
-  fillBox(room, 0, H - 1, 0, W - 1, H - 1, D - 1, MAT.BOUNDARY_HULL); // y = 63
-  fillBox(room, 0, 0, 0, W - 1, H - 1, 0, MAT.BOUNDARY_HULL); // z = 0 (North)
-  fillBox(room, 0, 0, D - 1, W - 1, H - 1, D - 1, MAT.BOUNDARY_HULL); // z = 239 (South)
-  fillBox(room, 0, 0, 0, 0, H - 1, D - 1, MAT.BOUNDARY_HULL); // x = 0 (West)
-  fillBox(room, W - 1, 0, 0, W - 1, H - 1, D - 1, MAT.BOUNDARY_HULL); // x = 239 (East)
+  fillBox(room, 0, 0, 0, W - 1, 0, D - 1, MAT.BOUNDARY_HULL);
+  fillBox(room, 0, H - 1, 0, W - 1, H - 1, D - 1, MAT.BOUNDARY_HULL);
+  fillBox(room, 0, 0, 0, W - 1, H - 1, 0, MAT.BOUNDARY_HULL);
+  fillBox(room, 0, 0, D - 1, W - 1, H - 1, D - 1, MAT.BOUNDARY_HULL);
+  fillBox(room, 0, 0, 0, 0, H - 1, D - 1, MAT.BOUNDARY_HULL);
+  fillBox(room, W - 1, 0, 0, W - 1, H - 1, D - 1, MAT.BOUNDARY_HULL);
 
-  // 2. Interior ceiling liner (y = 62) & base foundation slab (y = 1..11, deck top 1.2 m)
   fillBox(room, 1, H - 2, 1, W - 2, H - 2, D - 2, MAT.HULL_STEEL);
   fillBox(room, 1, 1, 1, W - 2, CARGO_DECK_TOP_Y - 1, D - 2, MAT.HULL_STEEL);
 
-  // 3. North airlock doorway (30x28 at y=2..29, sealed in-core by BOUNDARY_HULL on z=0)
-  //    + 2.0 m-deep vestibule trench (z=1..20, y=2..11 open AIR) + 5 walkable stairs (z=21..35)
-  const doorX0 = Math.floor((W - DOOR_WIDTH_VOXELS) / 2); // 105
-  const doorX1 = doorX0 + DOOR_WIDTH_VOXELS - 1; // 134
+  const doorX0 = Math.floor((W - DOOR_WIDTH_VOXELS) / 2);
+  const doorX1 = doorX0 + DOOR_WIDTH_VOXELS - 1;
   room.doors.push({
     face: 'N',
     minX: doorX0,
@@ -165,30 +164,23 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
   for (let s = 0; s < 5; s++) {
     const zStart = 21 + s * 3;
     const zEnd = zStart + 2;
-    const stepTopSolidY = 1 + (s + 1) * 2; // 3, 5, 7, 9, 11 -> top 0.4..1.2 m
+    const stepTopSolidY = 1 + (s + 1) * 2;
     if (stepTopSolidY < CARGO_DECK_TOP_Y - 1) {
       fillBox(room, doorX0, stepTopSolidY + 1, zStart, doorX1, CARGO_DECK_TOP_Y - 1, zEnd, MAT.AIR);
     }
   }
 
-  // 4. Central 8 m x 8 m sunken pit (x=80..159, z=80..159, y=2..11 open AIR above y=1 liner)
-  //    with 5 walkable exit steps along the West pit edge (x=80..94, z=108..131)
   fillBox(room, 80, 2, 80, 159, CARGO_DECK_TOP_Y - 1, 159, MAT.AIR);
   for (let s = 0; s < 5; s++) {
-    // s=0 at x=92..94 (top 0.4 m) climbing westward to s=4 at x=80..82 (top 1.2 m)
     const xEnd = 94 - s * 3;
     const xStart = xEnd - 2;
-    const topSolidY = 1 + (s + 1) * 2; // 3, 5, 7, 9, 11
+    const topSolidY = 1 + (s + 1) * 2;
     fillBox(room, xStart, 2, 108, xEnd, topSolidY, 131, MAT.HULL_STEEL);
   }
 
-  // 5. Elevated 0.2 m-thick STEEL_GRATE catwalk at y=36..37 (underside 3.6 m, top 3.8 m)
-  //    giving 2.4 m clear below (1.2..3.6 m) and 2.4 m clear above (3.8..6.2 m)
   fillBox(room, 44, CARGO_CATWALK_Y_MIN, 144, 195, CARGO_CATWALK_Y_MAX, 175, MAT.STEEL_GRATE);
-  // North-South spur crossing the eastern half of the pit for dramatic vertical sightlines
   fillBox(room, 144, CARGO_CATWALK_Y_MIN, 56, 175, CARGO_CATWALK_Y_MAX, 143, MAT.STEEL_GRATE);
 
-  // Structural HULL_STEEL support columns (4x4 voxels, y=12..35)
   const pillars: readonly [number, number][] = [
     [46, 146],
     [46, 170],
@@ -201,32 +193,29 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
     fillBox(room, px, CARGO_DECK_TOP_Y, pz, px + 3, CARGO_CATWALK_Y_MIN - 1, pz + 3, MAT.HULL_STEEL);
   }
 
-  // 13 walkable catwalk stairs (0.2 m rise x 0.3 m tread = 3.9 m run, z=105..143)
-  // Climbing from deck top y=12 (1.2 m) up to catwalk top y=38 (3.8 m)
   for (let s = 0; s < 13; s++) {
     const zStart = 105 + s * 3;
     const zEnd = zStart + 2;
-    const stepTopSolidY = CARGO_DECK_TOP_Y - 1 + (s + 1) * 2; // 13, 15, ..., 37
+    const stepTopSolidY = CARGO_DECK_TOP_Y - 1 + (s + 1) * 2;
     const stepBottomY = Math.max(CARGO_DECK_TOP_Y, stepTopSolidY - 1);
     fillBox(room, 48, stepBottomY, zStart, 67, stepTopSolidY, zEnd, MAT.HULL_STEEL);
   }
-  // Stair side support stringers on West/East edges down to deck at bottom & top
   fillBox(room, 48, CARGO_DECK_TOP_Y, 138, 49, CARGO_CATWALK_Y_MIN - 1, 143, MAT.HULL_STEEL);
   fillBox(room, 66, CARGO_DECK_TOP_Y, 138, 67, CARGO_CATWALK_Y_MIN - 1, 143, MAT.HULL_STEEL);
 
-  // 6. Four destructible GLASS_VAT hollow shells (16x15x16 outer -> 14x13x14 = 2,548 L interior)
-  //    Spaced >= 3.0 m apart: 2 WATER, 1 OIL, 1 CRYO
+  // 4 pre-filled GLASS_VAT shells: 2 WATER, 1 OIL, 1 CRYO (2,548 L each = 10,192 L total)
+  // One WATER vat sits on the elevated STEEL_GRATE catwalk so shattering floods straight through the grate
   buildGlassVatShell(room, 0, 24, CARGO_DECK_TOP_Y, 44, 16, 15, 16, MAT.WATER);
-  buildGlassVatShell(room, 1, 196, CARGO_DECK_TOP_Y, 44, 16, 15, 16, MAT.WATER);
+  buildGlassVatShell(room, 1, 144, CARGO_CATWALK_Y_MAX + 1, 82, 16, 15, 16, MAT.WATER);
   buildGlassVatShell(room, 2, 196, CARGO_DECK_TOP_Y, 194, 16, 15, 16, MAT.OIL);
   buildGlassVatShell(room, 3, 24, CARGO_DECK_TOP_Y, 194, 16, 15, 16, MAT.CRYO);
 
-  // 7. Destructible WOOD_BARRIER tactical cover walls (HP 12, 0.3 m thick, 2.0 m tall)
   fillBox(room, 66, CARGO_DECK_TOP_Y, 64, 95, CARGO_DECK_TOP_Y + 19, 66, MAT.WOOD_BARRIER);
   fillBox(room, 174, CARGO_DECK_TOP_Y, 102, 176, CARGO_DECK_TOP_Y + 19, 131, MAT.WOOD_BARRIER);
   fillBox(room, 96, CARGO_DECK_TOP_Y, 188, 125, CARGO_DECK_TOP_Y + 19, 190, MAT.WOOD_BARRIER);
 
-  // 8. Chunk flags: mark in-bounds chunks dirtySolidMesh, clear snapshot/decal/fluid flags
+  reseedActiveLists(room, 1);
+
   const cxMax = W >> 4;
   const cyMax = H >> 4;
   const czMax = D >> 4;
@@ -237,17 +226,17 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
         const oob = cx >= cxMax || cy >= cyMax || cz >= czMax;
         room.outOfBounds[cIdx] = oob ? 1 : 0;
         room.dirtySolidMesh[cIdx] = oob ? 0 : 1;
-        room.dirtyFluidRender[cIdx] = 0;
+        room.dirtyFluidRender[cIdx] = oob ? 0 : 1;
         room.dirtyDecals[cIdx] = 0;
         room.dirtySnapshot[cIdx] = 0;
       }
     }
   }
 
-  // Ensure TOTAL_CHUNKS invariant is consistent
   if (room.outOfBounds.length !== TOTAL_CHUNKS) {
     throw new Error('Chunk array mismatch');
   }
 
+  recountChunkFluids(room);
   recomputeRoomLedgers(room);
 }

@@ -28,6 +28,15 @@ import {
   type RoomState,
 } from './types.ts';
 import {
+  processPendingVatShatters,
+  reseedActiveLists,
+  stepBallisticsStage3,
+  stepFluidMovementStage4,
+  stepFluidStage8,
+  stepMinimalCryoWarming,
+  triggerZeroGLift,
+} from './fluids.ts';
+import {
   getEffectiveMassKg,
   getFeetY,
   getPlumbDir,
@@ -173,7 +182,7 @@ function applyWallImpactToSolidFace(
         else if (mat === MAT.GLASS_VAT || mat === MAT.ICE) baseDmg = 4;
         if (baseDmg === 0) continue;
         const mult = getTempByte(val) <= TEMP_BYTE.EMBRITTLED ? 3 : 1;
-        applyStructuralDamage(room, vx, vy, vz, baseDmg * mult, false);
+        applyStructuralDamage(room, vx, vy, vz, baseDmg * mult, true);
       }
     }
   }
@@ -486,6 +495,29 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
 
   // Stage 2: Entity Kinematics & Swept AABB Voxel Collisions
   integrateEntityVoxelPhysics(world, player);
+
+  // Process vat shatters & 1G->0G lift before ballistic integration
+  processPendingVatShatters(world);
+  if (world.justEnteredZeroGLiftDir !== 0) {
+    triggerZeroGLift(world, world.justEnteredZeroGLiftDir);
+    world.justEnteredZeroGLiftDir = 0;
+  }
+  if (world.gravityChangedThisTick) {
+    reseedActiveLists(world.room, world.simTick);
+    world.gravityChangedThisTick = false;
+  }
+
+  // Stage 3: Ballistic Quanta Integration & Swept 3D DDA
+  stepBallisticsStage3(world);
+
+  // Stage 4: 60 Hz Fluid & Gas Movement CA
+  stepFluidMovementStage4(world);
+
+  // M2.1 minimal CRYO finite floor/0G warming
+  stepMinimalCryoWarming(world);
+
+  // Stage 8: Deferred retries, overflow scanners & bit-22 cleanup
+  stepFluidStage8(world);
 }
 
 /**

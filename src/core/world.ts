@@ -16,7 +16,7 @@ import {
   type GravityMode,
   type MaterialId,
 } from './balance.ts';
-import { createEmptyRoomState, type RoomState } from './types.ts';
+import { createEmptyRoomState, type ConservationLedgers, type RoomState } from './types.ts';
 
 export interface GlandState {
   mat: MaterialId;
@@ -110,6 +110,9 @@ export interface WorldState {
   playerTank: PlayerTankState;
   gravityPulse: GravityPulseState;
   impactTelemetry: ImpactTelemetry;
+  justEnteredZeroGLiftDir: -1 | 0 | 1;
+  gravityChangedThisTick: boolean;
+  entryLedgers: ConservationLedgers;
   room: RoomState;
 }
 
@@ -209,6 +212,9 @@ export function createWorldState(runSeed: number): WorldState {
       lastImpactExempt: false,
       lastImpactTick: -1,
     },
+    justEnteredZeroGLiftDir: 0,
+    gravityChangedThisTick: false,
+    entryLedgers: { water: 0, oil: 0, cryo: 0, acid: 0, oilCombusted: 0, cryoBoiledOff: 0, acidConsumed: 0 },
     room: createEmptyRoomState(seed),
   };
 }
@@ -245,6 +251,7 @@ export function getPlumbDir(mode: GravityMode): -1 | 1 {
  * Stage 1: Input & Suit Gravity Pulse State Machine (§6.1, §8.1, §8.2).
  */
 export function stepSuitGravityState(world: WorldState, input: InputFrame): void {
+  const prevGravityMode = world.room.gravityMode;
   const gp = world.gravityPulse;
   const cdTicks = Math.round(gravCooldownS(world.gravCdRank) * 60);
 
@@ -285,9 +292,12 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
       gp.ownPulseExempt = true;
       gp.ownPulseGraceTicks = 60;
     } else if (gp.cooldownTicks === 0) {
-      // Toggle 1G <-> 0G, starting GRAV_CD immediately
+      const prevMode = world.room.gravityMode;
       world.room.gravityMode =
-        world.room.gravityMode === GRAVITY_MODE.G0 ? GRAVITY_MODE.G1 : GRAVITY_MODE.G0;
+        prevMode === GRAVITY_MODE.G0 ? GRAVITY_MODE.G1 : GRAVITY_MODE.G0;
+      if (world.room.gravityMode === GRAVITY_MODE.G0 && prevMode !== GRAVITY_MODE.G0) {
+        world.justEnteredZeroGLiftDir = prevMode === GRAVITY_MODE.GN1 ? -1 : 1;
+      }
       world.player.upSign = 1;
       gp.cooldownTicks = cdTicks;
       gp.ownPulseExempt = true;
@@ -315,6 +325,8 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
     }
   }
 
-  // Keep upSign aligned with room gravity
+  if (world.room.gravityMode !== prevGravityMode) {
+    world.gravityChangedThisTick = true;
+  }
   world.player.upSign = world.room.gravityMode === GRAVITY_MODE.GN1 ? -1 : 1;
 }

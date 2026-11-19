@@ -67,6 +67,8 @@ export class Scene3D {
   };
 
   private readonly hoverBox: THREE.LineSegments;
+  private readonly hoverNormalLine: THREE.Line;
+  private readonly hoverNormalPositions = new Float32Array(6);
   private readonly focusMarker: THREE.Mesh;
   private readonly decalMesh: THREE.InstancedMesh;
   private readonly decalPositionsByChunk: Array<number[]> = Array.from(
@@ -74,6 +76,8 @@ export class Scene3D {
     () => [],
   );
   private decalCount = 0;
+  private totalDecalCandidates = 0;
+  private readonly lastDecalSortPos = new THREE.Vector3(-999, -999, -999);
   private readonly doorMesh: THREE.Mesh;
 
   private readonly tmpMat4 = new THREE.Matrix4();
@@ -184,6 +188,15 @@ export class Scene3D {
     );
     this.hoverBox.visible = false;
     this.scene.add(this.hoverBox);
+
+    const normGeo = new THREE.BufferGeometry();
+    normGeo.setAttribute("position", new THREE.BufferAttribute(this.hoverNormalPositions, 3));
+    this.hoverNormalLine = new THREE.Line(
+      normGeo,
+      new THREE.LineBasicMaterial({ color: 0xff595e }),
+    );
+    this.hoverNormalLine.visible = false;
+    this.scene.add(this.hoverNormalLine);
 
     // Visual North airlock blast door overlay
     const doorGeo = new THREE.BoxGeometry(3.0, 2.8, 0.14);
@@ -429,7 +442,8 @@ export class Scene3D {
 
   private evictFarthestChunk(room: RoomState, protectedChunk: number): boolean {
     let victim = -1;
-    let bestScore = -1;
+    let bestDistSq = -1;
+    let oldestUsed = 0x7fffffff;
     for (let c = 0; c < TOTAL_CHUNKS; c++) {
       if (c === protectedChunk) continue;
       const hasMesh =
@@ -438,8 +452,14 @@ export class Scene3D {
         this.buckets[2].slots[c] !== null;
       if (!hasMesh) continue;
       const dSq = this.chunkDistSq(c);
-      if (dSq > bestScore) {
-        bestScore = dSq;
+      const lastUsed = this.chunkLastUsed[c];
+      // Distance-prioritized LRU: evict farthest chunk; break close distance ties by oldest chunkLastUsed
+      if (
+        dSq > bestDistSq + 1.0 ||
+        (Math.abs(dSq - bestDistSq) <= 1.0 && lastUsed < oldestUsed)
+      ) {
+        bestDistSq = dSq;
+        oldestUsed = lastUsed;
         victim = c;
       }
     }
@@ -544,13 +564,14 @@ export class Scene3D {
     this.dirtySortBuf.sort((a, b) => this.chunkDistSq(a) - this.chunkDistSq(b));
 
     const startMs = performance.now();
-    let processed = 0;
+    let budgetedCount = 0;
+    let attempted = 0;
     const plane = CHUNKS_X * CHUNKS_Z;
 
     for (let i = 0; i < this.dirtySortBuf.length; i++) {
       if (timeBudgetMs > 0) {
-        if (processed > 0 && performance.now() - startMs >= timeBudgetMs) break;
-      } else if (processed >= maxRemeshes) {
+        if (budgetedCount > 0 && performance.now() - startMs >= timeBudgetMs) break;
+      } else if (budgetedCount >= maxRemeshes) {
         break;
       }
 
@@ -580,12 +601,13 @@ export class Scene3D {
 
       room.dirtySolidMesh[cIdx] = 0;
       this.chunkLastUsed[cIdx] = this.frameCounter;
+      attempted++;
       if (hadFaces || timeBudgetMs === 0) {
-        processed++;
+        budgetedCount++;
       }
     }
 
-    return this.dirtySortBuf.length - processed;
+    return Math.max(0, this.dirtySortBuf.length - attempted);
   }
 
   /**
@@ -627,9 +649,10 @@ export class Scene3D {
       }
     }
 
-    if (!anyDirty) return;
+    const movedFar = this.focusPos.distanceToSquared(this.lastDecalSortPos) > 1.0;
+    if (!anyDirty && !(movedFar && this.totalDecalCandidates > MAX_DAMAGE_DECALS)) return;
 
-    const all: Array<{ x: number; y: number; z: number; dSq: number }> = [];
+    const all: Array<{ x: number; y: number; z: number; dSq: number; c: number }> = [];
     for (let c = 0; c < TOTAL_CHUNKS; c++) {
       const list = this.decalPositionsByChunk[c];
       for (let i = 0; i < list.length; i += 3) {
@@ -639,12 +662,19 @@ export class Scene3D {
         const dx = x - this.focusPos.x;
         const dy = y - this.focusPos.y;
         const dz = z - this.focusPos.z;
-        all.push({ x, y, z, dSq: dx * dx + dy * dy + dz * dz });
+        all.push({ x, y, z, dSq: dx * dx + dy * dy + dz * dz, c });
       }
     }
 
+    this.totalDecalCandidates = all.length;
+    this.lastDecalSortPos.copy(this.focusPos);
+
     if (all.length > MAX_DAMAGE_DECALS) {
       all.sort((a, b) => a.dSq - b.dSq);
+      // Re-mark retired chunks so their decals rebuild when approached (§4.4)
+      for (let i = MAX_DAMAGE_DECALS; i < all.length; i++) {
+        room.dirtyDecals[all[i].c] = 1;
+      }
     }
 
     const count = Math.min(all.length, MAX_DAMAGE_DECALS);
@@ -680,14 +710,22 @@ export class Scene3D {
     );
 
     if (hit) {
+      const cx = (hit.x + 0.5) * VOXEL_SIZE_M;
+      const cy = (hit.y + 0.5) * VOXEL_SIZE_M;
+      const cz = (hit.z + 0.5) * VOXEL_SIZE_M;
       this.hoverBox.visible = true;
-      this.hoverBox.position.set(
-        (hit.x + 0.5) * VOXEL_SIZE_M,
-        (hit.y + 0.5) * VOXEL_SIZE_M,
-        (hit.z + 0.5) * VOXEL_SIZE_M,
-      );
+      this.hoverBox.position.set(cx, cy, cz);
+      this.hoverNormalPositions[0] = cx + hit.nx * 0.05;
+      this.hoverNormalPositions[1] = cy + hit.ny * 0.05;
+      this.hoverNormalPositions[2] = cz + hit.nz * 0.05;
+      this.hoverNormalPositions[3] = cx + hit.nx * 0.35;
+      this.hoverNormalPositions[4] = cy + hit.ny * 0.35;
+      this.hoverNormalPositions[5] = cz + hit.nz * 0.35;
+      (this.hoverNormalLine.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      this.hoverNormalLine.visible = true;
     } else {
       this.hoverBox.visible = false;
+      this.hoverNormalLine.visible = false;
     }
     return hit;
   }

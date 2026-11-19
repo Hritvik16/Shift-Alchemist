@@ -1,3 +1,5 @@
+> **SUPERSEDED:** Legacy v1 Voronoi/mercury prototype specification. Canonical v2 spec is `DESIGN_AND_EXECUTION.md`.
+
 # Shift Alchemist — 3D Thermodynamic & Amalgamation Architecture
 
 ## 1. Core Design Pillars

@@ -1,7 +1,7 @@
 // Pure TypeScript 3D Physics:
-// - Footprint-aware floor detection + Anti-Wall-Climb surface rule
-// - 14m Range & Voxel Line-of-Sight (LOS) enforcement for Lock-On and Compressed Air Nozzle
-// - Player-vs-Entity (Alien/Crate) cylinder collision & separation
+// - 60 FPS Sub-Voxel Fluid Stepping (every frame instead of 20 Hz grid hopping!)
+// - Direct 3D Air-Nozzle Spray Impulse on Sub-Voxel Liquid Quanta
+// - 14m Range & Voxel Line-of-Sight (LOS) enforcement
 
 import {
   VOXEL_SIZE,
@@ -24,14 +24,13 @@ import {
   step3DFluidStencil,
   shatterCylindricalVat,
   isFluidMaterial,
+  syncQuantaToVoxelGrid,
 } from './fluids';
 
 const GRAVITY_ACCEL = 22.0;
 const STEP_UP_HEIGHT = 0.52;
 const SLAM_SPEED_THRESHOLD = 5.2;
 export const NOZZLE_MAX_RANGE = 14.0;
-
-let fluidStepAccumulator = 0;
 
 export function createPlayerRig(): PlayerRigState {
   return {
@@ -88,12 +87,6 @@ export function collidesWithWorld(
   return false;
 }
 
-/**
- * Footprint-Aware Floor Detection with Anti-Wall-Climb Rule:
- * - Samples center + 4 perimeter points of the entity's cylinder radius
- * - Only counts voxel (vx, vy, vz) as a floor surface if (vx, vy + 1, vz) is NOT solid,
- *   preventing entities pushed against or inside walls from climbing up the wall interior!
- */
 export function computeFloorAltitudeBelow(
   room: RoomGrid,
   wx: number,
@@ -127,7 +120,6 @@ export function computeFloorAltitudeBelow(
       if (idx === ignoreVoxelIdx) continue;
 
       if (isSolidVoxel(room, vx, vy, vz)) {
-        // Anti-wall-climb check: the cell directly above the floor surface must be non-solid!
         const aboveIdx = getVoxelIndex(room, vx, vy + 1, vz);
         const aboveIsSolid =
           aboveIdx !== ignoreVoxelIdx && isSolidVoxel(room, vx, vy + 1, vz);
@@ -145,9 +137,6 @@ export function computeFloorAltitudeBelow(
   return highestFloorY;
 }
 
-/**
- * Checks if there is an unobstructed Line-of-Sight (LOS) within maxRange between two 3D points
- */
 export function hasVoxelLineOfSight(
   room: RoomGrid,
   x0: number,
@@ -181,7 +170,15 @@ export function hasVoxelLineOfSight(
     if (!inRoomBounds(room, vx, vy, vz)) return false;
     const idx = getVoxelIndex(room, vx, vy, vz);
     if (ignoreIndices && ignoreIndices.has(idx)) continue;
-    if (isSolidVoxel(room, vx, vy, vz)) return false;
+    const mat = room.matGrid[idx] as MaterialID;
+    if (
+      mat === MaterialID.HULL_STEEL ||
+      mat === MaterialID.GLASS_VAT ||
+      mat === MaterialID.WOOD_CRATE ||
+      mat === MaterialID.ICE
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -199,7 +196,7 @@ export function toggleRoomGravity(room: RoomGrid, player: PlayerRigState): void 
 
     applyZeroGLiftImpulseToGrid(room);
     room.lastCombatLog =
-      '0G Activated — 3D surface-tension stencil pulling fluids into floating clusters!';
+      '0G Activated — Sub-voxel liquid droplets coalescing into floating 3D orbs!';
   } else {
     room.gravityG = 1.0;
     if (player.y - player.floorY > 0.35) {
@@ -210,9 +207,12 @@ export function toggleRoomGravity(room: RoomGrid, player: PlayerRigState): void 
         ent.vy = Math.min(ent.vy, -5.5);
       }
     }
+    for (const q of room.fluidQuanta) {
+      q.vy = Math.min(q.vy, -4.5);
+    }
     room.dirtyFluidRender = true;
     room.lastCombatLog =
-      '1G Restored — Airborne Aliens, Crates & 0G Fluid Clusters slamming down!';
+      '1G Restored — Airborne Aliens, Crates & Liquid Orbs slamming down!';
   }
 }
 
@@ -261,10 +261,6 @@ export function triggerPlayerDash(
   player.jetpackActive = true;
 }
 
-/**
- * Left-Click Compressed Air Burst:
- * - Strictly enforces 14.0m range AND stops at solid walls (no shooting through bulkheads!)
- */
 export function fireCompressedAirNozzle(
   room: RoomGrid,
   player: PlayerRigState,
@@ -290,7 +286,6 @@ export function fireCompressedAirNozzle(
   dirY /= rawDist;
   dirZ /= rawDist;
 
-  // Step along the nozzle beam up to NOZZLE_MAX_RANGE (14.0m) and stop at the first solid wall!
   const desiredDist = Math.min(rawDist, NOZZLE_MAX_RANGE);
   let actualDist = desiredDist;
   let struckGlassVoxelIdx = -1;
@@ -340,7 +335,7 @@ export function fireCompressedAirNozzle(
     player.vz -= dirZ * 2.4;
   }
 
-  // 1. Check Cylindrical Glass Vat Shatter (Requires within 14m range + unobstructed ray hit!)
+  // 1. Check Cylindrical Glass Vat Shatter
   for (let i = room.vats.length - 1; i >= 0; i--) {
     const vat = room.vats[i];
     const vatCenterY = vat.y + vat.height * 0.5;
@@ -376,54 +371,45 @@ export function fireCompressedAirNozzle(
       ) {
         const matName = MATERIAL_TABLE[vat.fluidMat].name;
         shatterCylindricalVat(room, vat);
-        room.lastCombatLog = `Shattered Cylindrical ${matName} Vat — 12.0L fluid released!`;
+        room.lastCombatLog = `Shattered ${matName} Vat — 240 ballistic micro-droplets unleashed!`;
         return;
       }
     }
   }
 
-  // 2. Apply 3D Velocity Impulse to Fluid Voxels near impact (Only if unobstructed by walls!)
-  let pushedFluidCells = 0;
-  const impVx = Math.floor(endX / VOXEL_SIZE);
-  const impVy = Math.floor(endY / VOXEL_SIZE);
-  const impVz = Math.floor(endZ / VOXEL_SIZE);
-
-  for (let dy = -2; dy <= 2; dy++) {
-    for (let dz = -2; dz <= 2; dz++) {
-      for (let dx = -2; dx <= 2; dx++) {
-        const vx = impVx + dx;
-        const vy = impVy + dy;
-        const vz = impVz + dz;
-        if (!inRoomBounds(room, vx, vy, vz)) continue;
-        const idx = getVoxelIndex(room, vx, vy, vz);
-        if (!isFluidMaterial(room.matGrid[idx] as MaterialID)) continue;
-
-        const cellWx = (vx + 0.5) * VOXEL_SIZE;
-        const cellWy = (vy + 0.5) * VOXEL_SIZE;
-        const cellWz = (vz + 0.5) * VOXEL_SIZE;
-        if (
-          hasVoxelLineOfSight(
-            room,
-            muzzleX,
-            muzzleY,
-            muzzleZ,
-            cellWx,
-            cellWy,
-            cellWz,
-            NOZZLE_MAX_RANGE
-          )
-        ) {
-          pushedFluidCells++;
-          room.vxGrid[idx] += dirX * 9.0;
-          room.vyGrid[idx] +=
-            room.gravityG === 0 ? dirY * 9.0 : Math.max(2.0, dirY * 6.0);
-          room.vzGrid[idx] += dirZ * 9.0;
-        }
+  // 2. Blast Sub-Voxel Liquid Quanta into a 60 FPS Noita Spray Arc!
+  let blastedQuanta = 0;
+  for (let i = 0; i < room.fluidQuanta.length; i++) {
+    const q = room.fluidQuanta[i];
+    const dImpact = Math.hypot(q.x - endX, q.y - endY, q.z - endZ);
+    if (dImpact <= 1.35) {
+      if (
+        hasVoxelLineOfSight(
+          room,
+          muzzleX,
+          muzzleY,
+          muzzleZ,
+          q.x,
+          q.y,
+          q.z,
+          NOZZLE_MAX_RANGE
+        )
+      ) {
+        blastedQuanta++;
+        const falloff = 1.0 - dImpact / 1.45;
+        const speed = (6.5 + q.shimmer * 3.5) * falloff;
+        q.vx += dirX * speed + (q.shimmer - 0.5) * 2.2;
+        q.vz += dirZ * speed + (((i * 7) % 10) / 10 - 0.5) * 2.2;
+        q.vy +=
+          room.gravityG === 0
+            ? dirY * speed
+            : Math.max(2.4, dirY * speed + 3.2 * falloff);
+        q.grounded = false;
       }
     }
   }
 
-  // 3. Punt Dynamic Entities (Requires within actualDist <= 14m AND unobstructed LOS!)
+  // 3. Punt Dynamic Entities (Crates & Aliens)
   let hitEntities = 0;
   for (const ent of room.entities) {
     const entCenterY = ent.y + ent.height * 0.5;
@@ -472,17 +458,14 @@ export function fireCompressedAirNozzle(
     }
   }
 
-  if (pushedFluidCells > 0) {
-    step3DFluidStencil(room, 0.05);
-    room.lastCombatLog = `Air Burst propelled ${pushedFluidCells} fluid stencil cells in 3D!`;
+  if (blastedQuanta > 0) {
+    room.dirtyFluidRender = true;
+    room.lastCombatLog = `Air Burst sprayed ${blastedQuanta} sub-voxel liquid droplets across the arena!`;
   } else if (hitEntities > 0) {
     room.lastCombatLog = `Air Burst punted ${hitEntities} target(s) — watch for Wall-Splat!`;
   }
 }
 
-/**
- * Finds the best 3D Magnetic Lock-On Target within 14m and unobstructed Line-of-Sight from the player
- */
 export function findMagneticLockOnTarget(
   room: RoomGrid,
   player: PlayerRigState,
@@ -504,7 +487,6 @@ export function findMagneticLockOnTarget(
   let bestTarget: LockOnTarget | null = null;
   let bestScore = 2.1;
 
-  // 1. Check Dynamic Entities (Aliens & Crates) within 14m & LOS
   for (const ent of room.entities) {
     const cy = ent.y + ent.height * 0.5;
     const toX = ent.x - rayOriginX;
@@ -551,7 +533,6 @@ export function findMagneticLockOnTarget(
     }
   }
 
-  // 2. Check Cylindrical Glass Vats within 14m & LOS
   for (const vat of room.vats) {
     const cy = vat.y + vat.height * 0.5;
     const toX = vat.x - rayOriginX;
@@ -595,8 +576,6 @@ export function findMagneticLockOnTarget(
   }
 
   if (bestTarget) return bestTarget;
-
-  // 3. Check Fluid Cluster around cursor ONLY when cursor ray hit room geometry and has LOS
   if (!cursorHitGeometry) return null;
 
   const cvx = Math.floor(cursorWorldX / VOXEL_SIZE);
@@ -634,7 +613,7 @@ export function findMagneticLockOnTarget(
               x: wx,
               y: wy,
               z: wz,
-              label: `${MATERIAL_TABLE[mat].name} Cluster (${room.volGrid[idx].toFixed(2)}L)`,
+              label: `${MATERIAL_TABLE[mat].name} Pool/Cluster (${room.volGrid[idx].toFixed(2)}L)`,
             };
           }
         }
@@ -683,11 +662,8 @@ export function stepWorldPhysics(
     }
   }
 
-  fluidStepAccumulator += clampedDt;
-  if (fluidStepAccumulator >= 0.05) {
-    fluidStepAccumulator = 0;
-    step3DFluidStencil(room, 0.05);
-  }
+  // Step the Sub-Voxel Noita Fluid Engine EVERY FRAME at 60 FPS!
+  step3DFluidStencil(room, clampedDt);
 
   const pvx = Math.floor(player.x / VOXEL_SIZE);
   const pvy = Math.floor((player.y + 0.1) / VOXEL_SIZE);
@@ -696,6 +672,24 @@ export function stepWorldPhysics(
     player.grounded &&
     inRoomBounds(room, pvx, pvy, pvz) &&
     room.matGrid[getVoxelIndex(room, pvx, pvy, pvz)] === MaterialID.OIL;
+
+  // Player feet physically splash through liquid quanta when running or landing!
+  const pSpeed = Math.hypot(player.vx, player.vy, player.vz);
+  if (pSpeed > 1.5) {
+    for (let i = 0; i < room.fluidQuanta.length; i++) {
+      const q = room.fluidQuanta[i];
+      if (q.mat === MaterialID.ICE) continue;
+      const dx = q.x - player.x;
+      const dy = q.y - (player.y + 0.25);
+      const dz = q.z - player.z;
+      if (Math.abs(dy) < 0.35 && dx * dx + dz * dz < 0.42 * 0.42) {
+        q.vx += player.vx * 0.35 + dx * 2.5;
+        q.vz += player.vz * 0.35 + dz * 2.5;
+        q.vy += Math.min(2.2, pSpeed * 0.25);
+        q.grounded = false;
+      }
+    }
+  }
 
   const dxAim = input.aimWorldX - player.x;
   const dzAim = input.aimWorldZ - player.z;
@@ -788,7 +782,6 @@ export function stepWorldPhysics(
     player.vz = 0;
   }
 
-  // Footprint-aware floorY computed BEFORE 0G vertical clamp so player never sinks into platforms!
   player.floorY = computeFloorAltitudeBelow(
     room,
     player.x,
@@ -835,6 +828,7 @@ export function stepWorldPhysics(
   }
 
   stepDynamicEntities(room, player, clampedDt);
+  syncQuantaToVoxelGrid(room);
 }
 
 function applyWallSplatDamage(
@@ -939,7 +933,6 @@ function stepDynamicEntities(
       ent.radius
     );
 
-    // 1. Player-vs-Entity Cylinder Collision & Separation (Prevents walking through Aliens/Crates!)
     const dyPlayer = Math.abs(
       ent.y + ent.height * 0.5 - (player.y + player.height * 0.5)
     );
@@ -953,7 +946,6 @@ function stepDynamicEntities(
         const nz = distP > 1e-4 ? dzP / distP : Math.cos(player.yaw);
         const overlap = minDistP - distP;
 
-        // Separate player and entity without pushing either into solid walls
         const pNextX = player.x - nx * overlap * 0.6;
         const pNextZ = player.z - nz * overlap * 0.6;
         if (
@@ -979,7 +971,6 @@ function stepDynamicEntities(
           ent.z = eNextZ;
         }
 
-        // Transfer momentum if dashing or colliding fast
         const relSpeed = Math.hypot(player.vx - ent.vx, player.vz - ent.vz);
         if (player.dashTimer > 0 || relSpeed > 4.5) {
           ent.vx += nx * 5.5;
@@ -988,7 +979,6 @@ function stepDynamicEntities(
       }
     }
 
-    // 2. Entity-vs-Entity Collisions
     for (let j = i - 1; j >= 0; j--) {
       const other = room.entities[j];
       const dy = Math.abs(ent.y + ent.height * 0.5 - (other.y + other.height * 0.5));

@@ -1,1606 +1,715 @@
-// Three.js Renderer:
-// - Continuous Flat-Topped 1G Puddle Surface Renderer (Zero bubble/grape-cluster look!)
-// - 3D Sphere Renderer for 0G Floating Clusters & 1G Falling Waterfall Streams
-// - Right-click carving a Glass Vat breaches & shatters the tank
-
 import * as THREE from 'three';
 import {
-  MaterialID,
-  MATERIAL_TABLE,
-  VOXEL_SIZE,
-  getVoxelIndex,
-  inRoomBounds,
-  isSolidVoxel,
-} from '../core/types';
-import type {
-  RoomGrid,
-  PlayerInputState,
-  PlayerRigState,
-  LockOnTarget,
-  GlassVatTank,
-} from '../core/types';
-import { setVoxel, recountActiveCells, spawnDynamicEntity } from '../core/roomGen';
-import { shatterCylindricalVat } from '../core/fluids';
+  ARENA_D,
+  ARENA_H,
+  ARENA_W,
+  CHUNKS_X,
+  CHUNKS_Y,
+  CHUNKS_Z,
+  CHUNK_SIZE,
+  MATERIAL_SPEC,
+  MAX_DAMAGE_DECALS,
+  MAX_MESH_MEM_MB,
+  MAX_REMESHES_PER_FRAME,
+  TOTAL_CHUNKS,
+  VOXEL_SIZE_M,
+} from '../core/balance.ts';
 import {
-  raycastVoxelGrid,
-  stepWorldPhysics,
-  toggleRoomGravity,
-  triggerPlayerDash,
-  fireCompressedAirNozzle,
-  findMagneticLockOnTarget,
-  computeFloorAltitudeBelow,
-} from '../core/physics';
+  cellIndex,
+  getDamage,
+  getMat,
+  isSolidMat,
+  raycastSolidVoxel,
+  type RoomState,
+  type VoxelRayHit,
+} from '../core/types.ts';
+import { buildChunkSolidMeshes, SOLID_BUCKET } from './greedyMesher.ts';
 
-const FLUID_MATERIALS: MaterialID[] = [
-  MaterialID.WATER,
-  MaterialID.OIL,
-  MaterialID.CRYO,
-];
-
-interface EntityVisualGroup {
-  root: THREE.Group;
-  bodyMesh: THREE.Mesh;
-  plumbLine: THREE.Line;
-  plumbRing: THREE.Mesh;
-  hpFillMesh: THREE.Mesh;
+interface BucketSlot {
+  geoId: number;
+  instId: number;
+  verts: number;
+  indices: number;
+  bytes: number;
 }
 
-interface OverhangVoxelRecord {
-  x: number;
-  y: number;
-  z: number;
-  wx: number;
-  wy: number;
-  wz: number;
-  r: number;
-  g: number;
-  b: number;
+interface BucketPool {
+  mesh: THREE.BatchedMesh;
+  maxVerts: number;
+  maxIndices: number;
+  bytesPerVert: number;
+  usedVerts: number;
+  usedIndices: number;
+  usedBytes: number;
+  slots: Array<BucketSlot | null>;
 }
 
-export class Scene3DViewer {
-  private room: RoomGrid;
-  private player: PlayerRigState;
-  private input: PlayerInputState = {
-    moveX: 0,
-    moveZ: 0,
-    moveY: 0,
-    aimWorldX: 12,
-    aimWorldY: 1.5,
-    aimWorldZ: 12,
-    cursorHitGeometry: false,
+const BUCKET_CONFIG = [
+  { maxInstances: TOTAL_CHUNKS, maxVerts: 420_000, maxIndices: 630_000, bytesPerVert: 36 },
+  { maxInstances: TOTAL_CHUNKS, maxVerts: 200_000, maxIndices: 300_000, bytesPerVert: 40 },
+  { maxInstances: TOTAL_CHUNKS, maxVerts: 120_000, maxIndices: 180_000, bytesPerVert: 36 },
+] as const;
+
+export class Scene3D {
+  public readonly renderer: THREE.WebGLRenderer;
+  public readonly scene: THREE.Scene;
+  public readonly camera: THREE.PerspectiveCamera;
+  public readonly focusPos = new THREE.Vector3(12.0, 1.2, 12.0);
+  public zoomDist = 22.0;
+
+  private readonly buckets: [BucketPool, BucketPool, BucketPool];
+  private readonly chunkLastUsed = new Int32Array(TOTAL_CHUNKS);
+  private frameCounter = 0;
+
+  private readonly cutawayUniforms = {
+    uCamPos: { value: new THREE.Vector3() },
+    uFocusPos: { value: new THREE.Vector3(12.0, 1.2, 12.0) },
   };
-  private keysPressed = new Set<string>();
 
-  private scene: THREE.Scene;
-  private camera: THREE.OrthographicCamera;
-  private renderer: THREE.WebGLRenderer;
+  private readonly hoverBox: THREE.LineSegments;
+  private readonly focusMarker: THREE.Mesh;
+  private readonly decalMesh: THREE.InstancedMesh;
+  private readonly decalPositionsByChunk: Array<number[]> = Array.from(
+    { length: TOTAL_CHUNKS },
+    () => [],
+  );
+  private decalCount = 0;
+  private readonly doorMesh: THREE.Mesh;
 
-  private viewSize = 7.4;
-  private camTargetPos = new THREE.Vector3(8, 2, 14);
+  private readonly tmpMat4 = new THREE.Matrix4();
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly mouseNdc = new THREE.Vector2();
+  private dirtySortBuf: number[] = [];
 
-  private hullOpaqueMesh!: THREE.InstancedMesh;
-  private hullBoundaryCutawayMesh!: THREE.InstancedMesh;
-  private hullOccludingMesh!: THREE.InstancedMesh;
-  private iceMesh!: THREE.InstancedMesh;
-  private glassBlockMesh!: THREE.InstancedMesh;
-  private overhangRecords: OverhangVoxelRecord[] = [];
-
-  // Separate 1G Flat Surface Pool Meshes vs. 0G/Waterfall Sphere Meshes
-  private fluidPoolMeshes = new Map<MaterialID, THREE.InstancedMesh>();
-  private fluidSphereMeshes = new Map<MaterialID, THREE.InstancedMesh>();
-  private fluidMaterials = new Map<MaterialID, THREE.Material>();
-  private dummy = new THREE.Object3D();
-  private colorScratch = new THREE.Color();
-
-  private playerGroup = new THREE.Group();
-  private leftLegPivot = new THREE.Group();
-  private rightLegPivot = new THREE.Group();
-  private leftArmPivot = new THREE.Group();
-  private rightArmPivot = new THREE.Group();
-  private thrusterFlameLeft!: THREE.Mesh;
-  private thrusterFlameRight!: THREE.Mesh;
-  private plumbLine!: THREE.Line;
-  private plumbRing!: THREE.Mesh;
-
-  private vatVisuals = new Map<number, THREE.Group>();
-  private entityVisuals = new Map<number, EntityVisualGroup>();
-
-  private airBurstMesh!: THREE.LineSegments;
-  private airBurstPositions = new Float32Array(32 * 2 * 3);
-
-  private lockOnTarget: LockOnTarget | null = null;
-  private lockReticleGroup = new THREE.Group();
-  private lockTargetPlumbLine!: THREE.Line;
-  private lockTargetPlumbRing!: THREE.Mesh;
-
-  private raycaster = new THREE.Raycaster();
-  private mouseNDC = new THREE.Vector2(0, 0);
-  private aimFallbackPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1.5);
-  private aimFallbackTarget = new THREE.Vector3();
-  private cursorMesh: THREE.LineSegments;
-  private hoveredVoxel: { x: number; y: number; z: number } | null = null;
-  private placeVoxelCoords: { x: number; y: number; z: number } | null = null;
-
-  private selectedMaterial: MaterialID = MaterialID.WATER;
-  private hudElement: HTMLDivElement;
-  private fps = 60;
-  private frameCount = 0;
-  private lastFpsTime = performance.now();
-  private lastFrameTime = performance.now();
-
-  constructor(container: HTMLElement, room: RoomGrid, player: PlayerRigState) {
-    this.room = room;
-    this.player = player;
-
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x090d14);
-
-    const aspect = window.innerWidth / window.innerHeight;
-    this.camera = new THREE.OrthographicCamera(
-      -this.viewSize * aspect,
-      this.viewSize * aspect,
-      this.viewSize,
-      -this.viewSize,
-      0.1,
-      120
-    );
-
-    this.camTargetPos.set(player.x, player.y + 0.8, player.z);
-    this.camera.position.set(player.x + 6.5, player.y + 18.0, player.z + 15.5);
-    this.camera.lookAt(this.camTargetPos);
-
+  constructor(container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       powerPreference: 'high-performance',
     });
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFShadowMap;
-    container.innerHTML = '';
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.08;
     container.appendChild(this.renderer.domElement);
 
-    const hemiLight = new THREE.HemisphereLight(0xa5b4fc, 0x1e293b, 0.85);
-    this.scene.add(hemiLight);
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x0b0f17);
 
-    const roomCenterX = (room.width * VOXEL_SIZE) / 2;
-    const roomCenterZ = (room.depth * VOXEL_SIZE) / 2;
+    const aspect = Math.max(1, container.clientWidth) / Math.max(1, container.clientHeight);
+    this.camera = new THREE.PerspectiveCamera(36, aspect, 0.5, 120);
 
-    const keyLight = new THREE.DirectionalLight(0xfffbeb, 1.4);
-    keyLight.position.set(roomCenterX + 12, 26, roomCenterZ + 14);
-    keyLight.target.position.set(roomCenterX, 0, roomCenterZ);
-    this.scene.add(keyLight.target);
-    keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(1024, 1024);
-    const d = 19;
-    keyLight.shadow.camera.left = -d;
-    keyLight.shadow.camera.right = d;
-    keyLight.shadow.camera.top = d;
-    keyLight.shadow.camera.bottom = -d;
-    keyLight.shadow.bias = -0.001;
-    this.scene.add(keyLight);
+    // Lighting (1 Directional Shadow Pass + ambient hemisphere fill)
+    const hemi = new THREE.HemisphereLight(0xb8d8ff, 0x3b4254, 0.95);
+    this.scene.add(hemi);
 
-    const cryoLight = new THREE.PointLight(0x22d3ee, 2.4, 10.0);
-    cryoLight.position.set(15.5, 1.5, 15.0);
-    this.scene.add(cryoLight);
+    const sun = new THREE.DirectionalLight(0xfff1dc, 1.55);
+    sun.position.set(22, 34, 18);
+    sun.target.position.set(12, 1.2, 12);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.near = 4;
+    sun.shadow.camera.far = 75;
+    sun.shadow.camera.left = -18;
+    sun.shadow.camera.right = 18;
+    sun.shadow.camera.top = 18;
+    sun.shadow.camera.bottom = -18;
+    sun.shadow.bias = -0.0004;
+    sun.shadow.normalBias = 0.04;
+    this.scene.add(sun);
+    this.scene.add(sun.target);
 
-    const catwalkLight = new THREE.PointLight(0xf59e0b, 2.0, 11.0);
-    catwalkLight.position.set(9.0, 5.5, 2.5);
-    this.scene.add(catwalkLight);
-
-    this.initInstancedMeshes();
-    this.initHumanoidRigAndPlumbLine();
-    this.initLockOnReticle();
-    this.initAirBurstBuffer();
-
-    const boxGeo = new THREE.BoxGeometry(
-      VOXEL_SIZE * 1.02,
-      VOXEL_SIZE * 1.02,
-      VOXEL_SIZE * 1.02
-    );
-    const edges = new THREE.EdgesGeometry(boxGeo);
-    this.cursorMesh = new THREE.LineSegments(
-      edges,
-      new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.45 })
-    );
-    this.scene.add(this.cursorMesh);
-
-    this.hudElement = document.createElement('div');
-    this.hudElement.style.cssText = `
-      position: fixed;
-      top: 12px;
-      left: 12px;
-      padding: 10px 14px;
-      background: rgba(9, 13, 20, 0.88);
-      border: 1px solid rgba(56, 189, 248, 0.45);
-      border-radius: 6px;
-      color: #e2e8f0;
-      font-family: 'SFMono-Regular', Consolas, monospace;
-      font-size: 12px;
-      line-height: 1.5;
-      pointer-events: none;
-      user-select: none;
-      z-index: 10;
-    `;
-    document.body.appendChild(this.hudElement);
-
-    window.addEventListener('resize', () => this.onResize());
-    window.addEventListener('mousemove', (e) => this.onMouseMove(e));
-    window.addEventListener('mousedown', (e) => this.onMouseDown(e));
-    window.addEventListener('wheel', (e) => this.onWheel(e), { passive: true });
-    window.addEventListener('contextmenu', (e) => e.preventDefault());
-    window.addEventListener('keydown', (e) => this.onKeyDown(e));
-    window.addEventListener('keyup', (e) => this.onKeyUp(e));
-    window.addEventListener('blur', () => this.clearKeysOnBlur());
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) this.clearKeysOnBlur();
+    // 3 BatchedMesh solid buckets
+    const opaqueMat = this.createVoxelMaterial({
+      transparent: false,
+      roughness: 0.78,
+      metalness: 0.28,
+      isGrate: false,
+      enableCutaway: true,
     });
-
-    this.rebuildDirtyInstances();
-    this.updateHUD();
-  }
-
-  private clearKeysOnBlur(): void {
-    this.keysPressed.clear();
-    this.syncMovementKeys();
-  }
-
-  private initAirBurstBuffer(): void {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute(
-      'position',
-      new THREE.BufferAttribute(this.airBurstPositions, 3)
-    );
-    geo.setDrawRange(0, 0);
-    const mat = new THREE.LineBasicMaterial({
-      color: 0x7dd3fc,
+    const transMat = this.createVoxelMaterial({
       transparent: true,
-      opacity: 0.85,
+      roughness: 0.16,
+      metalness: 0.1,
+      isGrate: false,
+      enableCutaway: false,
     });
-    this.airBurstMesh = new THREE.LineSegments(geo, mat);
-    this.airBurstMesh.frustumCulled = false;
-    this.scene.add(this.airBurstMesh);
-  }
-
-  private initInstancedMeshes(): void {
-    const seamlessBoxGeo = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
-
-    const hullOpaqueMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.48,
-      metalness: 0.45,
+    const grateMat = this.createVoxelMaterial({
+      transparent: false,
+      roughness: 0.52,
+      metalness: 0.65,
+      isGrate: true,
+      enableCutaway: true,
     });
 
-    const boundaryCutawayMat = new THREE.MeshStandardMaterial({
-      color: 0x64748b,
-      roughness: 0.35,
-      metalness: 0.5,
+    this.buckets = [
+      this.createBucketPool(SOLID_BUCKET.OPAQUE, opaqueMat, true, true, false),
+      this.createBucketPool(SOLID_BUCKET.TRANSPARENT, transMat, false, false, true),
+      this.createBucketPool(SOLID_BUCKET.GRATE, grateMat, true, true, false),
+    ];
+
+    // Damage decals (capped at MAX_DAMAGE_DECALS = 512)
+    const decalGeo = new THREE.BoxGeometry(0.105, 0.105, 0.105);
+    const decalMat = new THREE.MeshBasicMaterial({
+      color: 0x120a08,
+      wireframe: false,
       transparent: true,
-      opacity: 0.15,
+      opacity: 0.58,
       depthWrite: false,
     });
+    this.decalMesh = new THREE.InstancedMesh(decalGeo, decalMat, MAX_DAMAGE_DECALS);
+    this.decalMesh.count = 0;
+    this.decalMesh.frustumCulled = false;
+    this.scene.add(this.decalMesh);
 
-    const occludingCutawayMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.4,
-      metalness: 0.5,
-      transparent: true,
-      opacity: 0.2,
-      depthWrite: false,
-    });
-
-    this.hullOpaqueMesh = new THREE.InstancedMesh(seamlessBoxGeo, hullOpaqueMat, 16384);
-    this.hullOpaqueMesh.frustumCulled = false;
-    this.hullOpaqueMesh.castShadow = true;
-    this.hullOpaqueMesh.receiveShadow = true;
-    this.scene.add(this.hullOpaqueMesh);
-
-    this.hullBoundaryCutawayMesh = new THREE.InstancedMesh(
-      seamlessBoxGeo,
-      boundaryCutawayMat,
-      4096
-    );
-    this.hullBoundaryCutawayMesh.frustumCulled = false;
-    this.scene.add(this.hullBoundaryCutawayMesh);
-
-    this.hullOccludingMesh = new THREE.InstancedMesh(
-      seamlessBoxGeo,
-      occludingCutawayMat,
-      4096
-    );
-    this.hullOccludingMesh.frustumCulled = false;
-    this.scene.add(this.hullOccludingMesh);
-
-    const iceMat = new THREE.MeshStandardMaterial({
-      color: 0xbae6fd,
-      emissive: 0x0284c7,
-      emissiveIntensity: 0.25,
-      roughness: 0.12,
-      metalness: 0.15,
-    });
-    this.iceMesh = new THREE.InstancedMesh(seamlessBoxGeo, iceMat, 8192);
-    this.iceMesh.frustumCulled = false;
-    this.scene.add(this.iceMesh);
-
-    const glassBlockMat = new THREE.MeshStandardMaterial({
-      color: 0xbae6fd,
-      emissive: 0x0284c7,
-      emissiveIntensity: 0.2,
-      transparent: true,
-      opacity: 0.38,
-      roughness: 0.1,
-      metalness: 0.25,
-    });
-    this.glassBlockMesh = new THREE.InstancedMesh(seamlessBoxGeo, glassBlockMat, 2048);
-    this.glassBlockMesh.frustumCulled = false;
-    this.scene.add(this.glassBlockMesh);
-
-    // 1. Flat-Topped Liquid Slab Geometry for 1G Surface Puddles (eliminates dome/bubble artifacts!)
-    const flatPoolSlabGeo = new THREE.BoxGeometry(
-      VOXEL_SIZE * 1.02,
-      VOXEL_SIZE,
-      VOXEL_SIZE * 1.02
-    );
-
-    // 2. 3D Sphere Geometry for 0G Floating Clusters & 1G Falling Waterfall Droplets
-    const fluidSphereGeo = new THREE.SphereGeometry(VOXEL_SIZE * 0.72, 14, 12);
-
-    const waterMat = new THREE.MeshStandardMaterial({
-      color: 0x0ea5e9,
-      emissive: 0x0284c7,
-      emissiveIntensity: 0.25,
-      transparent: true,
-      opacity: 0.86,
-      roughness: 0.08,
-      metalness: 0.15,
-    });
-
-    const oilMat = new THREE.MeshStandardMaterial({
-      color: 0x18181b,
-      roughness: 0.08,
-      metalness: 0.35,
-    });
-
-    const cryoMat = new THREE.MeshStandardMaterial({
-      color: 0x67e8f9,
-      emissive: 0x06b6d4,
-      emissiveIntensity: 0.7,
-      transparent: true,
-      opacity: 0.9,
-      roughness: 0.12,
-    });
-
-    this.fluidMaterials.set(MaterialID.WATER, waterMat);
-    this.fluidMaterials.set(MaterialID.OIL, oilMat);
-    this.fluidMaterials.set(MaterialID.CRYO, cryoMat);
-
-    for (const matId of FLUID_MATERIALS) {
-      const mat = this.fluidMaterials.get(matId)!;
-
-      const poolMesh = new THREE.InstancedMesh(flatPoolSlabGeo, mat, 8192);
-      poolMesh.count = 0;
-      poolMesh.frustumCulled = false;
-      poolMesh.receiveShadow = true;
-      this.scene.add(poolMesh);
-      this.fluidPoolMeshes.set(matId, poolMesh);
-
-      const sphereMesh = new THREE.InstancedMesh(fluidSphereGeo, mat, 8192);
-      sphereMesh.count = 0;
-      sphereMesh.frustumCulled = false;
-      this.scene.add(sphereMesh);
-      this.fluidSphereMeshes.set(matId, sphereMesh);
-    }
-  }
-
-  private disposeGroupResources(group: THREE.Object3D): void {
-    group.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      if (mesh.geometry) {
-        mesh.geometry.dispose();
-      }
-      if (mesh.material) {
-        if (Array.isArray(mesh.material)) {
-          for (const m of mesh.material) {
-            if (!this.isSharedMaterial(m)) m.dispose();
-          }
-        } else if (!this.isSharedMaterial(mesh.material)) {
-          mesh.material.dispose();
-        }
-      }
-    });
-  }
-
-  private isSharedMaterial(mat: THREE.Material): boolean {
-    for (const shared of this.fluidMaterials.values()) {
-      if (shared === mat) return true;
-    }
-    return false;
-  }
-
-  private createCylindricalVatVisual(vat: GlassVatTank): THREE.Group {
-    const group = new THREE.Group();
-
-    const capMat = new THREE.MeshStandardMaterial({
-      color: 0x475569,
+    // Focus probe marker (represents future player torso for sightline cutaway verification)
+    const markerGeo = new THREE.CylinderGeometry(0.28, 0.28, 1.5, 16);
+    const markerMat = new THREE.MeshStandardMaterial({
+      color: 0x3be8b0,
+      emissive: 0x115544,
       roughness: 0.35,
-      metalness: 0.75,
-    });
-    const glassMat = new THREE.MeshStandardMaterial({
-      color: 0xbae6fd,
-      emissive: 0x0284c7,
-      emissiveIntensity: 0.18,
-      transparent: true,
-      opacity: 0.34,
-      roughness: 0.1,
-      metalness: 0.25,
-    });
-
-    const baseCap = new THREE.Mesh(
-      new THREE.CylinderGeometry(vat.radius * 1.04, vat.radius * 1.06, 0.16, 20),
-      capMat
-    );
-    baseCap.position.y = 0.08;
-    const topCap = new THREE.Mesh(
-      new THREE.CylinderGeometry(vat.radius * 1.04, vat.radius * 1.04, 0.16, 20),
-      capMat
-    );
-    topCap.position.y = vat.height - 0.08;
-
-    const liquidMat =
-      this.fluidMaterials.get(vat.fluidMat) ||
-      this.fluidMaterials.get(MaterialID.WATER)!;
-    const liquidCore = new THREE.Mesh(
-      new THREE.CylinderGeometry(
-        vat.radius * 0.82,
-        vat.radius * 0.82,
-        vat.height * 0.78,
-        18
-      ),
-      liquidMat
-    );
-    liquidCore.position.y = vat.height * 0.48;
-
-    const glassShell = new THREE.Mesh(
-      new THREE.CylinderGeometry(vat.radius, vat.radius, vat.height - 0.2, 20),
-      glassMat
-    );
-    glassShell.position.y = vat.height * 0.5;
-
-    group.add(baseCap, topCap, liquidCore, glassShell);
-    group.position.set(vat.x, vat.y, vat.z);
-    this.scene.add(group);
-    return group;
-  }
-
-  private initHumanoidRigAndPlumbLine(): void {
-    const suitArmorMat = new THREE.MeshStandardMaterial({
-      color: 0xe2e8f0,
-      roughness: 0.35,
-      metalness: 0.5,
-    });
-    const darkJointMat = new THREE.MeshStandardMaterial({
-      color: 0x334155,
-      roughness: 0.6,
-    });
-    const visorMat = new THREE.MeshStandardMaterial({
-      color: 0x38bdf8,
-      emissive: 0x0ea5e9,
-      emissiveIntensity: 0.85,
-      roughness: 0.1,
-    });
-    const tankMat = new THREE.MeshStandardMaterial({
-      color: 0xf59e0b,
-      roughness: 0.3,
       metalness: 0.4,
     });
+    this.focusMarker = new THREE.Mesh(markerGeo, markerMat);
+    this.focusMarker.castShadow = true;
+    this.scene.add(this.focusMarker);
 
-    const torso = new THREE.Mesh(
-      new THREE.BoxGeometry(0.36, 0.46, 0.24),
-      suitArmorMat
+    // Cursor hover voxel outline
+    const boxEdges = new THREE.EdgesGeometry(new THREE.BoxGeometry(0.11, 0.11, 0.11));
+    this.hoverBox = new THREE.LineSegments(
+      boxEdges,
+      new THREE.LineBasicMaterial({ color: 0xffd166 }),
     );
-    torso.position.y = 0.72;
-    torso.castShadow = true;
-    this.playerGroup.add(torso);
+    this.hoverBox.visible = false;
+    this.scene.add(this.hoverBox);
 
-    const head = new THREE.Mesh(
-      new THREE.BoxGeometry(0.28, 0.28, 0.28),
-      suitArmorMat
-    );
-    head.position.y = 1.12;
-    head.castShadow = true;
-    this.playerGroup.add(head);
+    // Visual North airlock blast door overlay
+    const doorGeo = new THREE.BoxGeometry(3.0, 2.8, 0.14);
+    const doorMat = new THREE.MeshStandardMaterial({
+      color: 0x263244,
+      emissive: 0x144d2a,
+      emissiveIntensity: 0.45,
+      roughness: 0.4,
+      metalness: 0.7,
+    });
+    this.doorMesh = new THREE.Mesh(doorGeo, doorMat);
+    this.doorMesh.position.set(12.0, 1.6, 0.08);
+    this.scene.add(this.doorMesh);
 
-    const visor = new THREE.Mesh(
-      new THREE.BoxGeometry(0.24, 0.12, 0.06),
-      visorMat
-    );
-    visor.position.set(0, 1.13, 0.13);
-    this.playerGroup.add(visor);
-
-    const backTank = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.11, 0.11, 0.42, 10),
-      tankMat
-    );
-    backTank.position.set(0, 0.76, -0.18);
-    this.playerGroup.add(backTank);
-
-    const thrusterGeo = new THREE.CylinderGeometry(0.05, 0.07, 0.22, 8);
-    const leftThruster = new THREE.Mesh(thrusterGeo, darkJointMat);
-    leftThruster.position.set(-0.14, 0.72, -0.18);
-    const rightThruster = new THREE.Mesh(thrusterGeo, darkJointMat);
-    rightThruster.position.set(0.14, 0.72, -0.18);
-    this.playerGroup.add(leftThruster, rightThruster);
-
-    const flameGeo = new THREE.ConeGeometry(0.06, 0.28, 8);
-    flameGeo.rotateX(Math.PI);
-    const flameMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
-    this.thrusterFlameLeft = new THREE.Mesh(flameGeo, flameMat);
-    this.thrusterFlameLeft.position.set(-0.14, 0.5, -0.18);
-    this.thrusterFlameRight = new THREE.Mesh(flameGeo, flameMat);
-    this.thrusterFlameRight.position.set(0.14, 0.5, -0.18);
-    this.playerGroup.add(this.thrusterFlameLeft, this.thrusterFlameRight);
-
-    const legGeo = new THREE.BoxGeometry(0.13, 0.46, 0.14);
-    const leftLeg = new THREE.Mesh(legGeo, darkJointMat);
-    leftLeg.position.y = -0.23;
-    this.leftLegPivot.position.set(-0.1, 0.48, 0);
-    this.leftLegPivot.add(leftLeg);
-
-    const rightLeg = new THREE.Mesh(legGeo, darkJointMat);
-    rightLeg.position.y = -0.23;
-    this.rightLegPivot.position.set(0.1, 0.48, 0);
-    this.rightLegPivot.add(rightLeg);
-
-    const armGeo = new THREE.BoxGeometry(0.11, 0.4, 0.12);
-    const leftArm = new THREE.Mesh(armGeo, suitArmorMat);
-    leftArm.position.y = -0.18;
-    this.leftArmPivot.position.set(-0.25, 0.9, 0);
-    this.leftArmPivot.add(leftArm);
-
-    const rightArm = new THREE.Mesh(armGeo, suitArmorMat);
-    rightArm.position.y = -0.18;
-    const nozzleBarrel = new THREE.Mesh(
-      new THREE.BoxGeometry(0.09, 0.09, 0.38),
-      tankMat
-    );
-    nozzleBarrel.position.set(0, -0.28, 0.18);
-    this.rightArmPivot.position.set(0.25, 0.9, 0);
-    this.rightArmPivot.add(rightArm, nozzleBarrel);
-
-    this.playerGroup.add(
-      this.leftLegPivot,
-      this.rightLegPivot,
-      this.leftArmPivot,
-      this.rightArmPivot
-    );
-    this.scene.add(this.playerGroup);
-
-    const lineGeo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(0, 1, 0),
-    ]);
-    this.plumbLine = new THREE.Line(
-      lineGeo,
-      new THREE.LineBasicMaterial({
-        color: 0x38bdf8,
-        transparent: true,
-        opacity: 0.85,
-      })
-    );
-    this.scene.add(this.plumbLine);
-
-    const ringGeo = new THREE.RingGeometry(0.24, 0.35, 24);
-    ringGeo.rotateX(-Math.PI / 2);
-    this.plumbRing = new THREE.Mesh(
-      ringGeo,
-      new THREE.MeshBasicMaterial({
-        color: 0x38bdf8,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.9,
-      })
-    );
-    this.scene.add(this.plumbRing);
+    this.updateCamera();
   }
 
-  private initLockOnReticle(): void {
-    const ringGeo = new THREE.RingGeometry(0.45, 0.56, 4);
-    ringGeo.rotateX(-Math.PI / 2);
-    const outerRing = new THREE.Mesh(
-      ringGeo,
-      new THREE.MeshBasicMaterial({
-        color: 0xfacc15,
-        side: THREE.DoubleSide,
-      })
+  private createBucketPool(
+    idx: number,
+    material: THREE.Material,
+    castShadow: boolean,
+    receiveShadow: boolean,
+    sortObjects: boolean,
+  ): BucketPool {
+    const cfg = BUCKET_CONFIG[idx];
+    const mesh = new THREE.BatchedMesh(
+      cfg.maxInstances,
+      cfg.maxVerts,
+      cfg.maxIndices,
+      material,
     );
-    const vertGeo = new THREE.RingGeometry(0.38, 0.46, 16);
-    const vertRing = new THREE.Mesh(
-      vertGeo,
-      new THREE.MeshBasicMaterial({
-        color: 0xef4444,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.8,
-      })
-    );
-    this.lockReticleGroup.add(outerRing, vertRing);
-    this.lockReticleGroup.visible = false;
-    this.scene.add(this.lockReticleGroup);
+    mesh.castShadow = castShadow;
+    mesh.receiveShadow = receiveShadow;
+    mesh.sortObjects = sortObjects;
+    mesh.perObjectFrustumCulled = true;
+    mesh.frustumCulled = false;
+    this.scene.add(mesh);
 
-    const lineGeo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(0, 1, 0),
-    ]);
-    this.lockTargetPlumbLine = new THREE.Line(
-      lineGeo,
-      new THREE.LineBasicMaterial({
-        color: 0xfacc15,
-        transparent: true,
-        opacity: 0.85,
-      })
-    );
-    this.lockTargetPlumbLine.visible = false;
-    this.scene.add(this.lockTargetPlumbLine);
-
-    const tRingGeo = new THREE.RingGeometry(0.22, 0.32, 20);
-    tRingGeo.rotateX(-Math.PI / 2);
-    this.lockTargetPlumbRing = new THREE.Mesh(
-      tRingGeo,
-      new THREE.MeshBasicMaterial({
-        color: 0xfacc15,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.85,
-      })
-    );
-    this.lockTargetPlumbRing.visible = false;
-    this.scene.add(this.lockTargetPlumbRing);
+    return {
+      mesh,
+      maxVerts: cfg.maxVerts,
+      maxIndices: cfg.maxIndices,
+      bytesPerVert: cfg.bytesPerVert,
+      usedVerts: 0,
+      usedIndices: 0,
+      usedBytes: 0,
+      slots: new Array<BucketSlot | null>(TOTAL_CHUNKS).fill(null),
+    };
   }
 
-  private createEntityVisual(kind: 'crate' | 'alien'): EntityVisualGroup {
-    const root = new THREE.Group();
-    let bodyMesh: THREE.Mesh;
+  private createVoxelMaterial(opts: {
+    transparent: boolean;
+    roughness: number;
+    metalness: number;
+    isGrate: boolean;
+    enableCutaway: boolean;
+  }): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: opts.roughness,
+      metalness: opts.metalness,
+      transparent: opts.transparent,
+      depthWrite: !opts.transparent,
+      side: opts.transparent ? THREE.FrontSide : THREE.FrontSide,
+    });
 
-    if (kind === 'crate') {
-      const crateGeo = new THREE.BoxGeometry(0.68, 0.68, 0.68);
-      const crateMat = new THREE.MeshStandardMaterial({
-        color: 0xd97706,
-        roughness: 0.7,
-        metalness: 0.1,
-      });
-      bodyMesh = new THREE.Mesh(crateGeo, crateMat);
-      bodyMesh.position.y = 0.34;
-      bodyMesh.castShadow = true;
-      bodyMesh.receiveShadow = true;
+    const uniforms = this.cutawayUniforms;
+    const isGrate = opts.isGrate;
+    const enableCutaway = opts.enableCutaway;
 
-      const bandEdges = new THREE.EdgesGeometry(
-        new THREE.BoxGeometry(0.7, 0.7, 0.7)
-      );
-      const bandLines = new THREE.LineSegments(
-        bandEdges,
-        new THREE.LineBasicMaterial({ color: 0x78350f })
-      );
-      bandLines.position.y = 0.34;
-      root.add(bodyMesh, bandLines);
-    } else {
-      const chitinMat = new THREE.MeshStandardMaterial({
-        color: 0x1e1b4b,
-        emissive: 0x311042,
-        emissiveIntensity: 0.35,
-        roughness: 0.25,
-        metalness: 0.6,
-      });
-      const glandMat = new THREE.MeshStandardMaterial({
-        color: 0xa855f7,
-        emissive: 0x9333ea,
-        emissiveIntensity: 0.75,
-        roughness: 0.2,
-      });
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uCamPos = uniforms.uCamPos;
+      shader.uniforms.uFocusPos = uniforms.uFocusPos;
 
-      bodyMesh = new THREE.Mesh(
-        new THREE.BoxGeometry(0.42, 0.56, 0.34),
-        chitinMat
-      );
-      bodyMesh.position.y = 0.68;
-      bodyMesh.castShadow = true;
-      root.add(bodyMesh);
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+           varying vec3 vVoxelWorldPos;
+           varying vec3 vVoxelWorldNormal;`,
+        )
+        .replace(
+          '#include <worldpos_vertex>',
+          `#include <worldpos_vertex>
+           vec4 customWp = vec4( transformed, 1.0 );
+           #ifdef USE_BATCHING
+             customWp = batchingMatrix * customWp;
+           #endif
+           #ifdef USE_INSTANCING
+             customWp = instanceMatrix * customWp;
+           #endif
+           customWp = modelMatrix * customWp;
+           vVoxelWorldPos = customWp.xyz;
+           vVoxelWorldNormal = normalize( mat3( modelMatrix ) * objectNormal );`,
+        );
 
-      const cranium = new THREE.Mesh(
-        new THREE.BoxGeometry(0.26, 0.24, 0.62),
-        chitinMat
-      );
-      cranium.position.set(0, 1.12, 0.12);
-      cranium.rotation.x = 0.2;
-      root.add(cranium);
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+           uniform vec3 uCamPos;
+           uniform vec3 uFocusPos;
+           varying vec3 vVoxelWorldPos;
+           varying vec3 vVoxelWorldNormal;
 
-      const sac = new THREE.Mesh(
-        new THREE.SphereGeometry(0.18, 10, 10),
-        glandMat
-      );
-      sac.position.set(0, 0.82, -0.2);
-      root.add(sac);
+           float voxelHash(vec3 p) {
+             p = fract(p * 0.1031);
+             p += dot(p, p.yzx + 33.33);
+             return fract((p.x + p.y) * p.z);
+           }
 
-      const legGeo = new THREE.BoxGeometry(0.12, 0.45, 0.12);
-      const lLeg = new THREE.Mesh(legGeo, chitinMat);
-      lLeg.position.set(-0.16, 0.22, 0);
-      const rLeg = new THREE.Mesh(legGeo, chitinMat);
-      rLeg.position.set(0.16, 0.22, 0);
-      root.add(lLeg, rLeg);
+           float bayer4(vec2 coord) {
+             int x = int(mod(coord.x, 4.0));
+             int y = int(mod(coord.y, 4.0));
+             int idx = y * 4 + x;
+             if (idx == 0) return 0.0 / 16.0;
+             if (idx == 1) return 8.0 / 16.0;
+             if (idx == 2) return 2.0 / 16.0;
+             if (idx == 3) return 10.0 / 16.0;
+             if (idx == 4) return 12.0 / 16.0;
+             if (idx == 5) return 4.0 / 16.0;
+             if (idx == 6) return 14.0 / 16.0;
+             if (idx == 7) return 6.0 / 16.0;
+             if (idx == 8) return 3.0 / 16.0;
+             if (idx == 9) return 11.0 / 16.0;
+             if (idx == 10) return 1.0 / 16.0;
+             if (idx == 11) return 9.0 / 16.0;
+             if (idx == 12) return 15.0 / 16.0;
+             if (idx == 13) return 7.0 / 16.0;
+             if (idx == 14) return 13.0 / 16.0;
+             return 5.0 / 16.0;
+           }`,
+        )
+        .replace(
+          '#include <color_fragment>',
+          `#include <color_fragment>
+           // Subtle 10 cm Noita/Teardown voxel shimmer
+           vec3 cellCoord = floor(vVoxelWorldPos * 10.0 - vVoxelWorldNormal * 0.05);
+           float sh = voxelHash(cellCoord);
+           diffuseColor.rgb *= (0.92 + 0.16 * sh);
+           ${
+             isGrate
+               ? `
+           // Selective-permeable steel grate openings on horizontal faces
+           if (abs(vVoxelWorldNormal.y) > 0.5) {
+             vec2 gSub = fract(vVoxelWorldPos.xz * 15.0);
+             if (gSub.x > 0.24 && gSub.x < 0.76 && gSub.y > 0.24 && gSub.y < 0.76) {
+               discard;
+             }
+           }`
+               : ''
+           }
+           ${
+             enableCutaway
+               ? `
+           // Surgical sightline X-ray cutaway for overhanging catwalk/pillars above focus
+           if (vVoxelWorldPos.y > uFocusPos.y + 1.55) {
+             vec3 toFocus = (uFocusPos + vec3(0.0, 0.8, 0.0)) - uCamPos;
+             float rayLen = length(toFocus);
+             vec3 rayDir = toFocus / max(rayLen, 0.001);
+             vec3 toFrag = vVoxelWorldPos - uCamPos;
+             float proj = dot(toFrag, rayDir);
+             if (proj > 0.5 && proj < rayLen - 0.35) {
+               vec3 closest = uCamPos + rayDir * proj;
+               float perpDist = length(vVoxelWorldPos - closest);
+               if (perpDist < 2.1) {
+                 float fade = smoothstep(1.1, 2.1, perpDist);
+                 if (bayer4(gl_FragCoord.xy) > fade) {
+                   discard;
+                 }
+               }
+             }
+           }`
+               : ''
+           }`,
+        );
+    };
+
+    mat.customProgramCacheKey = () =>
+      `voxel_${opts.transparent ? 1 : 0}_${opts.isGrate ? 1 : 0}_${opts.enableCutaway ? 1 : 0}`;
+    return mat;
+  }
+
+  public resize(width: number, height: number): void {
+    this.camera.aspect = Math.max(1, width) / Math.max(1, height);
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(width, height);
+  }
+
+  public updateCamera(): void {
+    // Fixed 45° yaw (South-East -> North-West) and 48° pitch (§5)
+    const pitchRad = (48 * Math.PI) / 180;
+    const dy = this.zoomDist * Math.sin(pitchRad);
+    const dh = this.zoomDist * Math.cos(pitchRad);
+    const dXZ = dh * Math.SQRT1_2;
+
+    this.camera.position.set(
+      this.focusPos.x + dXZ,
+      this.focusPos.y + 0.8 + dy,
+      this.focusPos.z + dXZ,
+    );
+    this.camera.lookAt(this.focusPos.x, this.focusPos.y + 0.8, this.focusPos.z);
+
+    this.cutawayUniforms.uCamPos.value.copy(this.camera.position);
+    this.cutawayUniforms.uFocusPos.value.copy(this.focusPos);
+    this.focusMarker.position.set(this.focusPos.x, this.focusPos.y + 0.75, this.focusPos.z);
+  }
+
+  public getTotalMeshMemMB(): number {
+    const bytes =
+      this.buckets[0].usedBytes + this.buckets[1].usedBytes + this.buckets[2].usedBytes;
+    return bytes / (1024 * 1024);
+  }
+
+  public getMeshedChunkCount(): number {
+    let count = 0;
+    for (let c = 0; c < TOTAL_CHUNKS; c++) {
+      if (
+        this.buckets[0].slots[c] !== null ||
+        this.buckets[1].slots[c] !== null ||
+        this.buckets[2].slots[c] !== null
+      ) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  public getDecalCount(): number {
+    return this.decalCount;
+  }
+
+  private removeChunkFromBucket(pool: BucketPool, cIdx: number): void {
+    const slot = pool.slots[cIdx];
+    if (!slot) return;
+    pool.mesh.deleteInstance(slot.instId);
+    pool.mesh.deleteGeometry(slot.geoId);
+    pool.usedVerts -= slot.verts;
+    pool.usedIndices -= slot.indices;
+    pool.usedBytes -= slot.bytes;
+    pool.slots[cIdx] = null;
+  }
+
+  private evictFarthestChunk(room: RoomState, protectedChunk: number): boolean {
+    let victim = -1;
+    let bestScore = -1;
+    for (let c = 0; c < TOTAL_CHUNKS; c++) {
+      if (c === protectedChunk) continue;
+      const hasMesh =
+        this.buckets[0].slots[c] !== null ||
+        this.buckets[1].slots[c] !== null ||
+        this.buckets[2].slots[c] !== null;
+      if (!hasMesh) continue;
+      const dSq = this.chunkDistSq(c);
+      if (dSq > bestScore) {
+        bestScore = dSq;
+        victim = c;
+      }
+    }
+    if (victim === -1) return false;
+    for (let b = 0; b < 3; b++) {
+      this.removeChunkFromBucket(this.buckets[b], victim);
+    }
+    room.dirtySolidMesh[victim] = 1;
+    return true;
+  }
+
+  private uploadBucketGeometry(
+    room: RoomState,
+    bIdx: number,
+    cIdx: number,
+    cx: number,
+    cy: number,
+    cz: number,
+    geo: THREE.BufferGeometry | null,
+    verts: number,
+    indices: number,
+  ): void {
+    const pool = this.buckets[bIdx];
+    this.removeChunkFromBucket(pool, cIdx);
+    if (!geo || verts === 0) return;
+
+    const bytes = verts * pool.bytesPerVert + indices * 4;
+    const capBytes = MAX_MESH_MEM_MB * 1024 * 1024;
+
+    // Enforce 48 MB LRU/distance cap and bucket capacity
+    let guard = 0;
+    while (
+      guard < 64 &&
+      (this.buckets[0].usedBytes +
+        this.buckets[1].usedBytes +
+        this.buckets[2].usedBytes +
+        bytes >
+        capBytes ||
+        pool.usedVerts + verts > pool.maxVerts ||
+        pool.usedIndices + indices > pool.maxIndices)
+    ) {
+      if (!this.evictFarthestChunk(room, cIdx)) break;
+      guard++;
     }
 
-    const barY = kind === 'alien' ? 1.52 : 0.92;
-    const bgPlane = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.75, 0.09),
-      new THREE.MeshBasicMaterial({ color: 0x0f172a, side: THREE.DoubleSide })
-    );
-    bgPlane.position.set(0, barY, 0);
-    bgPlane.rotation.x = -0.65;
-
-    const hpFillMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.71, 0.06),
-      new THREE.MeshBasicMaterial({
-        color: kind === 'alien' ? 0xef4444 : 0xf59e0b,
-        side: THREE.DoubleSide,
-      })
-    );
-    hpFillMesh.position.set(0, barY, 0.01);
-    hpFillMesh.rotation.x = -0.65;
-    root.add(bgPlane, hpFillMesh);
-
-    const lineGeo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(0, 1, 0),
-    ]);
-    const plumbLine = new THREE.Line(
-      lineGeo,
-      new THREE.LineBasicMaterial({
-        color: 0xef4444,
-        transparent: true,
-        opacity: 0.7,
-      })
-    );
-    this.scene.add(plumbLine);
-
-    const ringGeo = new THREE.RingGeometry(0.2, 0.28, 18);
-    ringGeo.rotateX(-Math.PI / 2);
-    const plumbRing = new THREE.Mesh(
-      ringGeo,
-      new THREE.MeshBasicMaterial({
-        color: 0xef4444,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.7,
-      })
-    );
-    this.scene.add(plumbRing);
-    this.scene.add(root);
-
-    return { root, bodyMesh, plumbLine, plumbRing, hpFillMesh };
-  }
-
-  public rebuildDirtyInstances(): void {
-    const { width, height, depth, matGrid, volGrid, vxGrid, vyGrid, vzGrid } = this.room;
-
-    if (this.room.dirtyStaticRender) {
-      let opaqueCount = 0;
-      let boundaryCutawayCount = 0;
-      let iceCount = 0;
-      let glassBlockCount = 0;
-      this.overhangRecords = [];
-
-      const cylinderVatVoxels = new Set<number>();
-      for (const vat of this.room.vats) {
-        for (const vIdx of vat.voxelIndices) {
-          cylinderVatVoxels.add(vIdx);
-        }
-      }
-
-      for (let y = 0; y < height; y++) {
-        for (let z = 0; z < depth; z++) {
-          for (let x = 0; x < width; x++) {
-            const idx = getVoxelIndex(this.room, x, y, z);
-            const mat = matGrid[idx] as MaterialID;
-            if (
-              mat !== MaterialID.HULL_STEEL &&
-              mat !== MaterialID.ICE &&
-              mat !== MaterialID.GLASS_VAT
-            ) {
-              continue;
-            }
-
-            if (mat === MaterialID.GLASS_VAT && cylinderVatVoxels.has(idx)) {
-              continue;
-            }
-
-            if (
-              mat === MaterialID.HULL_STEEL &&
-              y < 2 &&
-              x > 0 &&
-              x < width - 1 &&
-              z > 0 &&
-              z < depth - 1 &&
-              isSolidVoxel(this.room, x, y + 1, z) &&
-              isSolidVoxel(this.room, x + 1, y, z) &&
-              isSolidVoxel(this.room, x - 1, y, z) &&
-              isSolidVoxel(this.room, x, y, z + 1) &&
-              isSolidVoxel(this.room, x, y, z - 1)
-            ) {
-              continue;
-            }
-
-            const wx = (x + 0.5) * VOXEL_SIZE;
-            const wy = (y + 0.5) * VOXEL_SIZE;
-            const wz = (z + 0.5) * VOXEL_SIZE;
-
-            this.dummy.position.set(wx, wy, wz);
-            this.dummy.scale.set(1, 1, 1);
-            this.dummy.updateMatrix();
-
-            if (mat === MaterialID.ICE) {
-              if (iceCount < this.iceMesh.instanceMatrix.count) {
-                this.iceMesh.setMatrixAt(iceCount++, this.dummy.matrix);
-              }
-              continue;
-            }
-
-            if (mat === MaterialID.GLASS_VAT) {
-              if (glassBlockCount < this.glassBlockMesh.instanceMatrix.count) {
-                this.glassBlockMesh.setMatrixAt(glassBlockCount++, this.dummy.matrix);
-              }
-              continue;
-            }
-
-            const isSouthOrEastUpperWall =
-              (z === depth - 1 || x === width - 1) && y > 3;
-            if (isSouthOrEastUpperWall) {
-              if (boundaryCutawayCount < this.hullBoundaryCutawayMesh.instanceMatrix.count) {
-                this.hullBoundaryCutawayMesh.setMatrixAt(
-                  boundaryCutawayCount++,
-                  this.dummy.matrix
-                );
-              }
-              continue;
-            }
-
-            const isOuterWall =
-              x === 0 || x === width - 1 || z === 0 || z === depth - 1;
-            const isStairs = x >= 1 && x <= 5 && z >= 9 && z <= 22;
-            const isOverhangOrPillar = !isOuterWall && !isStairs && y >= 3;
-
-            const checker = (x + z) % 2 === 0 ? 0.018 : 0.0;
-            if (y === 0) {
-              this.colorScratch.setRGB(0.15 + checker, 0.2 + checker, 0.27 + checker);
-            } else if (y <= 2) {
-              this.colorScratch.setRGB(0.29 + checker, 0.34 + checker, 0.42 + checker);
-            } else if (y === 7) {
-              const isEdge =
-                z === Math.max(7, Math.floor(depth * 0.18)) || x === width - 8;
-              if (isEdge && (x + z) % 2 === 0) {
-                this.colorScratch.setRGB(0.9, 0.62, 0.14);
-              } else {
-                this.colorScratch.setRGB(0.44 + checker, 0.49 + checker, 0.58 + checker);
-              }
-            } else if (isStairs) {
-              this.colorScratch.setRGB(0.55, 0.47, 0.34);
-            } else {
-              this.colorScratch.setRGB(0.24 + y * 0.014, 0.28 + y * 0.014, 0.36 + y * 0.014);
-            }
-
-            if (isOverhangOrPillar) {
-              this.overhangRecords.push({
-                x,
-                y,
-                z,
-                wx,
-                wy,
-                wz,
-                r: this.colorScratch.r,
-                g: this.colorScratch.g,
-                b: this.colorScratch.b,
-              });
-            } else if (opaqueCount < this.hullOpaqueMesh.instanceMatrix.count) {
-              this.hullOpaqueMesh.setMatrixAt(opaqueCount, this.dummy.matrix);
-              this.hullOpaqueMesh.setColorAt(opaqueCount, this.colorScratch);
-              opaqueCount++;
-            }
-          }
-        }
-      }
-
-      this.hullOpaqueMesh.userData.baseCount = opaqueCount;
-      this.hullBoundaryCutawayMesh.count = boundaryCutawayCount;
-      this.hullBoundaryCutawayMesh.instanceMatrix.needsUpdate = true;
-
-      this.iceMesh.count = iceCount;
-      this.iceMesh.instanceMatrix.needsUpdate = true;
-
-      this.glassBlockMesh.count = glassBlockCount;
-      this.glassBlockMesh.instanceMatrix.needsUpdate = true;
-
-      this.room.dirtyStaticRender = false;
-      this.updateSurgicalOcclusionInstances();
+    let geoId: number;
+    try {
+      geoId = pool.mesh.addGeometry(geo);
+    } catch {
+      // Compact fragmented deleted geometry slots and retry once
+      pool.mesh.optimize();
+      geoId = pool.mesh.addGeometry(geo);
     }
 
-    // Rebuild 1G Flat Surface Pools vs. 0G/Waterfall Spheres
-    if (this.room.dirtyFluidRender) {
-      const poolCounts = new Map<MaterialID, number>();
-      const sphereCounts = new Map<MaterialID, number>();
-      for (const m of FLUID_MATERIALS) {
-        poolCounts.set(m, 0);
-        sphereCounts.set(m, 0);
+    const instId = pool.mesh.addInstance(geoId);
+    this.tmpMat4.makeTranslation(
+      cx * CHUNK_SIZE * VOXEL_SIZE_M,
+      cy * CHUNK_SIZE * VOXEL_SIZE_M,
+      cz * CHUNK_SIZE * VOXEL_SIZE_M,
+    );
+    pool.mesh.setMatrixAt(instId, this.tmpMat4);
+
+    pool.usedVerts += verts;
+    pool.usedIndices += indices;
+    pool.usedBytes += bytes;
+    pool.slots[cIdx] = { geoId, instId, verts, indices, bytes };
+
+    geo.dispose();
+  }
+
+  private chunkDistSq(cIdx: number): number {
+    const plane = CHUNKS_X * CHUNKS_Z;
+    const cy = Math.floor(cIdx / plane);
+    const rem = cIdx - cy * plane;
+    const cz = Math.floor(rem / CHUNKS_X);
+    const cx = rem - cz * CHUNKS_X;
+    const mx = (cx + 0.5) * CHUNK_SIZE * VOXEL_SIZE_M;
+    const my = (cy + 0.5) * CHUNK_SIZE * VOXEL_SIZE_M;
+    const mz = (cz + 0.5) * CHUNK_SIZE * VOXEL_SIZE_M;
+    const dx = mx - this.focusPos.x;
+    const dy = my - this.focusPos.y;
+    const dz = mz - this.focusPos.z;
+    return dx * dx + dy * dy + dz * dz;
+  }
+
+  /**
+   * Distance-prioritized solid chunk remeshing (Stage 9).
+   * If timeBudgetMs > 0 (initial load / paused airlock), meshes until budget expires.
+   */
+  public processDirtyMeshes(room: RoomState, maxRemeshes = MAX_REMESHES_PER_FRAME, timeBudgetMs = 0): number {
+    this.frameCounter++;
+    this.dirtySortBuf.length = 0;
+
+    for (let c = 0; c < TOTAL_CHUNKS; c++) {
+      if (room.dirtySolidMesh[c] && !room.outOfBounds[c]) {
+        this.dirtySortBuf.push(c);
+      }
+    }
+
+    if (this.dirtySortBuf.length === 0) return 0;
+
+    this.dirtySortBuf.sort((a, b) => this.chunkDistSq(a) - this.chunkDistSq(b));
+
+    const startMs = performance.now();
+    let processed = 0;
+    const plane = CHUNKS_X * CHUNKS_Z;
+
+    for (let i = 0; i < this.dirtySortBuf.length; i++) {
+      if (timeBudgetMs > 0) {
+        if (processed > 0 && performance.now() - startMs >= timeBudgetMs) break;
+      } else if (processed >= maxRemeshes) {
+        break;
       }
 
-      for (let y = 0; y < height; y++) {
-        for (let z = 0; z < depth; z++) {
-          for (let x = 0; x < width; x++) {
-            const idx = getVoxelIndex(this.room, x, y, z);
-            const mat = matGrid[idx] as MaterialID;
-            if (
-              mat !== MaterialID.WATER &&
-              mat !== MaterialID.OIL &&
-              mat !== MaterialID.CRYO
-            ) {
-              continue;
-            }
+      const cIdx = this.dirtySortBuf[i];
+      const cy = Math.floor(cIdx / plane);
+      const rem = cIdx - cy * plane;
+      const cz = Math.floor(rem / CHUNKS_X);
+      const cx = rem - cz * CHUNKS_X;
 
-            const vol = volGrid[idx];
-            if (vol <= 0.001) continue;
+      const res = buildChunkSolidMeshes(room, cx, cy, cz);
+      const hadFaces =
+        res.vertexCounts[0] > 0 || res.vertexCounts[1] > 0 || res.vertexCounts[2] > 0;
 
-            // Compute neighbor average volume and metaball shift
-            let shiftX = 0;
-            let shiftY = 0;
-            let shiftZ = 0;
-            let neighborWeight = 0;
-            let horizSameSum = vol;
-            let horizSameCount = 1;
+      for (let b = 0; b < 3; b++) {
+        this.uploadBucketGeometry(
+          room,
+          b,
+          cIdx,
+          cx,
+          cy,
+          cz,
+          res.geometries[b],
+          res.vertexCounts[b],
+          res.indexCounts[b],
+        );
+      }
 
-            for (let dy = -1; dy <= 1; dy++) {
-              for (let dz = -1; dz <= 1; dz++) {
-                for (let dx = -1; dx <= 1; dx++) {
-                  if (dx === 0 && dy === 0 && dz === 0) continue;
-                  const nx = x + dx;
-                  const ny = y + dy;
-                  const nz = z + dz;
-                  if (!inRoomBounds(this.room, nx, ny, nz)) continue;
-                  const nIdx = getVoxelIndex(this.room, nx, ny, nz);
-                  if (matGrid[nIdx] === mat) {
-                    const w = volGrid[nIdx];
-                    shiftX += dx * w;
-                    shiftY += dy * w;
-                    shiftZ += dz * w;
-                    neighborWeight += w;
-                    if (dy === 0) {
-                      horizSameSum += w;
-                      horizSameCount++;
-                    }
-                  }
-                }
-              }
-            }
+      room.dirtySolidMesh[cIdx] = 0;
+      this.chunkLastUsed[cIdx] = this.frameCounter;
+      if (hadFaces || timeBudgetMs === 0) {
+        processed++;
+      }
+    }
 
-            if (neighborWeight > 0) {
-              shiftX = Math.max(-0.2, Math.min(0.2, (shiftX / neighborWeight) * 0.16));
-              shiftY = Math.max(-0.2, Math.min(0.2, (shiftY / neighborWeight) * 0.16));
-              shiftZ = Math.max(-0.2, Math.min(0.2, (shiftZ / neighborWeight) * 0.16));
-            }
+    return this.dirtySortBuf.length - processed;
+  }
 
-            const belowMat =
-              y > 0
-                ? (matGrid[getVoxelIndex(this.room, x, y - 1, z)] as MaterialID)
-                : MaterialID.HULL_STEEL;
-            const restingOnFloorIn1G =
-              this.room.gravityG > 0 &&
-              (MATERIAL_TABLE[belowMat].isSolid || belowMat === mat);
+  /**
+   * Rebuilds damage decals from dirtyDecals flags, capped at 512 nearest to focusPos (§4.4).
+   */
+  public processDirtyDecals(room: RoomState): void {
+    let anyDirty = false;
+    const plane = CHUNKS_X * CHUNKS_Z;
 
-            if (restingOnFloorIn1G) {
-              // Render as a flat-topped continuous liquid slab (smoothed height across neighbors!)
-              const poolMesh = this.fluidPoolMeshes.get(mat)!;
-              const pIdx = poolCounts.get(mat)!;
-              if (pIdx >= poolMesh.instanceMatrix.count) continue;
+    for (let c = 0; c < TOTAL_CHUNKS; c++) {
+      if (!room.dirtyDecals[c]) continue;
+      anyDirty = true;
+      room.dirtyDecals[c] = 0;
+      const list = this.decalPositionsByChunk[c];
+      list.length = 0;
+      if (room.outOfBounds[c]) continue;
 
-              const avgVol = horizSameSum / horizSameCount;
-              const slabHeight = Math.max(0.12, Math.min(0.85, avgVol * 0.42));
-              // Slight horizontal overlap when surrounded by same fluid so seams vanish completely
-              const widthScale = horizSameCount > 1 ? 1.03 : 0.96;
+      const cy = Math.floor(c / plane);
+      const rem = c - cy * plane;
+      const cz = Math.floor(rem / CHUNKS_X);
+      const cx = rem - cz * CHUNKS_X;
+      const x0 = cx * CHUNK_SIZE;
+      const y0 = cy * CHUNK_SIZE;
+      const z0 = cz * CHUNK_SIZE;
 
-              this.dummy.position.set(
-                (x + 0.5) * VOXEL_SIZE,
-                (y + 0.5 * slabHeight) * VOXEL_SIZE,
-                (z + 0.5) * VOXEL_SIZE
+      for (let y = y0; y < y0 + CHUNK_SIZE && y < room.roomH; y++) {
+        for (let z = z0; z < z0 + CHUNK_SIZE && z < room.roomD; z++) {
+          for (let x = x0; x < x0 + CHUNK_SIZE && x < room.roomW; x++) {
+            const val = room.grid[cellIndex(x, y, z)];
+            if (isSolidMat(getMat(val)) && getDamage(val) > 0) {
+              list.push(
+                (x + 0.5) * VOXEL_SIZE_M,
+                (y + 0.5) * VOXEL_SIZE_M,
+                (z + 0.5) * VOXEL_SIZE_M,
               );
-              this.dummy.scale.set(widthScale, slabHeight, widthScale);
-              this.dummy.updateMatrix();
-              poolMesh.setMatrixAt(pIdx, this.dummy.matrix);
-              poolCounts.set(mat, pIdx + 1);
-            } else {
-              // Render airborne 1G waterfalls and 0G floating clusters as smooth 3D spheres/droplets!
-              const sphereMesh = this.fluidSphereMeshes.get(mat)!;
-              const sIdx = sphereCounts.get(mat)!;
-              if (sIdx >= sphereMesh.instanceMatrix.count) continue;
-
-              if (this.room.gravityG > 0 && vyGrid[idx] < -0.5) {
-                const wScale = Math.max(0.55, Math.min(1.05, 0.8 * Math.cbrt(vol)));
-                const stretchY = Math.max(1.35, Math.min(2.3, Math.abs(vyGrid[idx]) * 0.4));
-                this.dummy.position.set(
-                  (x + 0.5 + vxGrid[idx] * 0.04) * VOXEL_SIZE,
-                  (y + 0.5) * VOXEL_SIZE,
-                  (z + 0.5 + vzGrid[idx] * 0.04) * VOXEL_SIZE
-                );
-                this.dummy.scale.set(wScale, stretchY, wScale);
-              } else {
-                const sphereScale = Math.max(
-                  0.65,
-                  Math.min(1.7, 0.9 * Math.cbrt(vol) + Math.min(0.45, neighborWeight * 0.08))
-                );
-                this.dummy.position.set(
-                  (x + 0.5 + shiftX) * VOXEL_SIZE,
-                  (y + 0.5 + shiftY) * VOXEL_SIZE,
-                  (z + 0.5 + shiftZ) * VOXEL_SIZE
-                );
-                this.dummy.scale.set(sphereScale, sphereScale, sphereScale);
-              }
-
-              this.dummy.updateMatrix();
-              sphereMesh.setMatrixAt(sIdx, this.dummy.matrix);
-              sphereCounts.set(mat, sIdx + 1);
             }
           }
         }
       }
-
-      for (const m of FLUID_MATERIALS) {
-        const poolMesh = this.fluidPoolMeshes.get(m)!;
-        poolMesh.count = poolCounts.get(m) || 0;
-        poolMesh.instanceMatrix.needsUpdate = true;
-
-        const sphereMesh = this.fluidSphereMeshes.get(m)!;
-        sphereMesh.count = sphereCounts.get(m) || 0;
-        sphereMesh.instanceMatrix.needsUpdate = true;
-      }
-
-      this.room.dirtyFluidRender = false;
     }
+
+    if (!anyDirty) return;
+
+    const all: Array<{ x: number; y: number; z: number; dSq: number }> = [];
+    for (let c = 0; c < TOTAL_CHUNKS; c++) {
+      const list = this.decalPositionsByChunk[c];
+      for (let i = 0; i < list.length; i += 3) {
+        const x = list[i];
+        const y = list[i + 1];
+        const z = list[i + 2];
+        const dx = x - this.focusPos.x;
+        const dy = y - this.focusPos.y;
+        const dz = z - this.focusPos.z;
+        all.push({ x, y, z, dSq: dx * dx + dy * dy + dz * dz });
+      }
+    }
+
+    if (all.length > MAX_DAMAGE_DECALS) {
+      all.sort((a, b) => a.dSq - b.dSq);
+    }
+
+    const count = Math.min(all.length, MAX_DAMAGE_DECALS);
+    for (let i = 0; i < count; i++) {
+      this.tmpMat4.makeTranslation(all[i].x, all[i].y, all[i].z);
+      this.decalMesh.setMatrixAt(i, this.tmpMat4);
+    }
+    this.decalMesh.count = count;
+    this.decalMesh.instanceMatrix.needsUpdate = true;
+    this.decalCount = count;
   }
 
-  private updateSurgicalOcclusionInstances(): void {
-    const baseCount: number = this.hullOpaqueMesh.userData.baseCount || 0;
-    let opaqueIdx = baseCount;
-    let occludingIdx = 0;
-
-    const camX = this.camera.position.x;
-    const camY = this.camera.position.y;
-    const camZ = this.camera.position.z;
-
-    const actors: { x: number; y: number; z: number }[] = [
-      { x: this.player.x, y: this.player.y + 0.65, z: this.player.z },
-    ];
-    for (const ent of this.room.entities) {
-      if (ent.kind === 'alien') {
-        actors.push({ x: ent.x, y: ent.y + 0.65, z: ent.z });
-      }
-    }
-
-    for (let i = 0; i < this.overhangRecords.length; i++) {
-      const rec = this.overhangRecords[i];
-      let isOccludingAnyActor = false;
-
-      for (let a = 0; a < actors.length; a++) {
-        const act = actors[a];
-        if (rec.wy < act.y - 0.2) continue;
-
-        const abX = camX - act.x;
-        const abY = camY - act.y;
-        const abZ = camZ - act.z;
-        const abLenSq = abX * abX + abY * abY + abZ * abZ;
-
-        const apX = rec.wx - act.x;
-        const apY = rec.wy - act.y;
-        const apZ = rec.wz - act.z;
-        const t = (apX * abX + apY * abY + apZ * abZ) / abLenSq;
-
-        if (t > 0.02 && t < 0.85) {
-          const closestX = act.x + abX * t;
-          const closestY = act.y + abY * t;
-          const closestZ = act.z + abZ * t;
-          const distSq =
-            (rec.wx - closestX) ** 2 +
-            (rec.wy - closestY) ** 2 +
-            (rec.wz - closestZ) ** 2;
-          if (distSq < 1.65 * 1.65) {
-            isOccludingAnyActor = true;
-            break;
-          }
-        }
-      }
-
-      this.dummy.position.set(rec.wx, rec.wy, rec.wz);
-      this.dummy.scale.set(1, 1, 1);
-      this.dummy.updateMatrix();
-      this.colorScratch.setRGB(rec.r, rec.g, rec.b);
-
-      if (isOccludingAnyActor) {
-        if (occludingIdx < this.hullOccludingMesh.instanceMatrix.count) {
-          this.hullOccludingMesh.setMatrixAt(occludingIdx, this.dummy.matrix);
-          this.hullOccludingMesh.setColorAt(occludingIdx, this.colorScratch);
-          occludingIdx++;
-        }
-      } else if (opaqueIdx < this.hullOpaqueMesh.instanceMatrix.count) {
-        this.hullOpaqueMesh.setMatrixAt(opaqueIdx, this.dummy.matrix);
-        this.hullOpaqueMesh.setColorAt(opaqueIdx, this.colorScratch);
-        opaqueIdx++;
-      }
-    }
-
-    this.hullOpaqueMesh.count = opaqueIdx;
-    this.hullOpaqueMesh.instanceMatrix.needsUpdate = true;
-    if (this.hullOpaqueMesh.instanceColor)
-      this.hullOpaqueMesh.instanceColor.needsUpdate = true;
-
-    this.hullOccludingMesh.count = occludingIdx;
-    this.hullOccludingMesh.instanceMatrix.needsUpdate = true;
-    if (this.hullOccludingMesh.instanceColor)
-      this.hullOccludingMesh.instanceColor.needsUpdate = true;
-  }
-
-  private updateRaycastAndLockOn(): void {
-    this.raycaster.setFromCamera(this.mouseNDC, this.camera);
-    const ray = this.raycaster.ray;
-    const hit = raycastVoxelGrid(
-      this.room,
-      ray.origin.x,
-      ray.origin.y,
-      ray.origin.z,
-      ray.direction.x,
-      ray.direction.y,
-      ray.direction.z
+  public pickVoxel(
+    room: RoomState,
+    clientX: number,
+    clientY: number,
+  ): VoxelRayHit | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.mouseNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouseNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouseNdc, this.camera);
+    const { origin, direction } = this.raycaster.ray;
+    const hit = raycastSolidVoxel(
+      room,
+      origin.x,
+      origin.y,
+      origin.z,
+      direction.x,
+      direction.y,
+      direction.z,
+      80,
+      true,
     );
 
     if (hit) {
-      this.hoveredVoxel = hit.hitVoxel;
-      this.placeVoxelCoords = hit.adjacentVoxel;
-      this.input.aimWorldX = hit.worldPoint.x;
-      this.input.aimWorldY = hit.worldPoint.y;
-      this.input.aimWorldZ = hit.worldPoint.z;
-      this.input.cursorHitGeometry = true;
-
-      this.cursorMesh.visible = true;
-      this.cursorMesh.position.set(
-        (this.placeVoxelCoords.x + 0.5) * VOXEL_SIZE,
-        (this.placeVoxelCoords.y + 0.5) * VOXEL_SIZE,
-        (this.placeVoxelCoords.z + 0.5) * VOXEL_SIZE
+      this.hoverBox.visible = true;
+      this.hoverBox.position.set(
+        (hit.x + 0.5) * VOXEL_SIZE_M,
+        (hit.y + 0.5) * VOXEL_SIZE_M,
+        (hit.z + 0.5) * VOXEL_SIZE_M,
       );
     } else {
-      this.cursorMesh.visible = false;
-      this.hoveredVoxel = null;
-      this.placeVoxelCoords = null;
-      this.input.cursorHitGeometry = false;
-
-      this.aimFallbackPlane.constant = -(this.player.y + 0.75);
-      if (ray.intersectPlane(this.aimFallbackPlane, this.aimFallbackTarget)) {
-        this.input.aimWorldX = this.aimFallbackTarget.x;
-        this.input.aimWorldY = this.aimFallbackTarget.y;
-        this.input.aimWorldZ = this.aimFallbackTarget.z;
-      } else {
-        this.input.aimWorldX = ray.origin.x + ray.direction.x * 20;
-        this.input.aimWorldY = ray.origin.y + ray.direction.y * 20;
-        this.input.aimWorldZ = ray.origin.z + ray.direction.z * 20;
-      }
+      this.hoverBox.visible = false;
     }
-
-    this.lockOnTarget = findMagneticLockOnTarget(
-      this.room,
-      this.player,
-      ray.origin.x,
-      ray.origin.y,
-      ray.origin.z,
-      ray.direction.x,
-      ray.direction.y,
-      ray.direction.z,
-      this.input.aimWorldX,
-      this.input.aimWorldY,
-      this.input.aimWorldZ,
-      this.input.cursorHitGeometry
-    );
-
-    if (this.lockOnTarget) {
-      this.input.aimWorldX = this.lockOnTarget.x;
-      this.input.aimWorldY = this.lockOnTarget.y;
-      this.input.aimWorldZ = this.lockOnTarget.z;
-    }
+    return hit;
   }
 
-  private syncMovementKeys(): void {
-    const w = this.keysPressed.has('KeyW') || this.keysPressed.has('ArrowUp');
-    const s = this.keysPressed.has('KeyS') || this.keysPressed.has('ArrowDown');
-    const a = this.keysPressed.has('KeyA') || this.keysPressed.has('ArrowLeft');
-    const d = this.keysPressed.has('KeyD') || this.keysPressed.has('ArrowRight');
-    const up = this.keysPressed.has('KeyE');
-    const down =
-      this.keysPressed.has('ShiftLeft') || this.keysPressed.has('ShiftRight');
-
-    this.input.moveZ = (s ? 1 : 0) - (w ? 1 : 0);
-    this.input.moveX = (d ? 1 : 0) - (a ? 1 : 0);
-    this.input.moveY = (up ? 1 : 0) - (down ? 1 : 0);
-  }
-
-  private updateCameraAndVisuals(dt: number): void {
-    const p = this.player;
-    this.playerGroup.position.set(p.x, p.y, p.z);
-    this.playerGroup.rotation.y = p.yaw;
-
-    const lookAheadX = Math.max(-2.2, Math.min(2.2, (this.input.aimWorldX - p.x) * 0.18));
-    const lookAheadZ = Math.max(-2.2, Math.min(2.2, (this.input.aimWorldZ - p.z) * 0.18));
-    const desiredCamX = p.x + lookAheadX;
-    const desiredCamY = p.y * 0.5 + 1.2;
-    const desiredCamZ = p.z + lookAheadZ;
-
-    const camLerp = Math.min(1, dt * 7.5);
-    this.camTargetPos.x += (desiredCamX - this.camTargetPos.x) * camLerp;
-    this.camTargetPos.y += (desiredCamY - this.camTargetPos.y) * camLerp;
-    this.camTargetPos.z += (desiredCamZ - this.camTargetPos.z) * camLerp;
-
-    this.camera.position.set(
-      this.camTargetPos.x + 6.5,
-      this.camTargetPos.y + 18.0,
-      this.camTargetPos.z + 15.5
-    );
-    this.camera.lookAt(this.camTargetPos);
-
-    this.updateSurgicalOcclusionInstances();
-
-    const limbLerp = Math.min(1, dt * 16);
-    let targetLLeg = 0;
-    let targetRLeg = 0;
-    let targetLArm = -0.15;
-    let targetRArm = -0.35;
-
-    if (this.room.gravityG === 0 || !p.grounded) {
-      targetLLeg = 0.25;
-      targetRLeg = -0.2;
-      targetLArm = -0.35;
-      targetRArm = -0.5;
-    } else {
-      const swing = Math.sin(p.walkPhase) * 0.55 * p.walkBlend;
-      targetLLeg = swing;
-      targetRLeg = -swing;
-      targetLArm = -swing * 0.65;
-      targetRArm = -0.35 + swing * 0.2;
-    }
-
-    this.leftLegPivot.rotation.x += (targetLLeg - this.leftLegPivot.rotation.x) * limbLerp;
-    this.rightLegPivot.rotation.x += (targetRLeg - this.rightLegPivot.rotation.x) * limbLerp;
-    this.leftArmPivot.rotation.x += (targetLArm - this.leftArmPivot.rotation.x) * limbLerp;
-    this.rightArmPivot.rotation.x += (targetRArm - this.rightArmPivot.rotation.x) * limbLerp;
-
-    const showFlames = this.room.gravityG === 0 || p.jetpackActive;
-    this.thrusterFlameLeft.visible = showFlames;
-    this.thrusterFlameRight.visible = showFlames;
-    if (showFlames) {
-      const pulse = (p.dashTimer > 0 ? 1.6 : 0.85) + 0.3 * Math.sin(performance.now() * 0.025);
-      this.thrusterFlameLeft.scale.set(1, pulse, 1);
-      this.thrusterFlameRight.scale.set(1, pulse, 1);
-    }
-
-    const altitude = Math.max(0, p.y - p.floorY);
-    this.plumbRing.position.set(p.x, p.floorY + 0.02, p.z);
-    (this.plumbRing.material as THREE.MeshBasicMaterial).color.setHex(
-      this.room.gravityG === 0 ? 0x38bdf8 : 0x4ade80
-    );
-
-    const posAttr = this.plumbLine.geometry.getAttribute(
-      'position'
-    ) as THREE.BufferAttribute;
-    posAttr.setXYZ(0, p.x, p.floorY + 0.02, p.z);
-    posAttr.setXYZ(1, p.x, p.y + 0.1, p.z);
-    posAttr.needsUpdate = true;
-    this.plumbLine.visible = altitude > 0.05 || this.room.gravityG === 0;
-
-    const activeVatIds = new Set<number>();
-    for (const vat of this.room.vats) {
-      activeVatIds.add(vat.id);
-      if (!this.vatVisuals.has(vat.id)) {
-        this.vatVisuals.set(vat.id, this.createCylindricalVatVisual(vat));
-      }
-    }
-    for (const [id, group] of this.vatVisuals.entries()) {
-      if (!activeVatIds.has(id)) {
-        this.scene.remove(group);
-        this.disposeGroupResources(group);
-        this.vatVisuals.delete(id);
-      }
-    }
-
-    const activeIds = new Set<number>();
-    for (const ent of this.room.entities) {
-      activeIds.add(ent.id);
-      let vis = this.entityVisuals.get(ent.id);
-      if (!vis) {
-        vis = this.createEntityVisual(ent.kind);
-        this.entityVisuals.set(ent.id, vis);
-      }
-
-      vis.root.position.set(ent.x, ent.y, ent.z);
-      vis.root.rotation.y = ent.yaw;
-
-      const mat = vis.bodyMesh.material as THREE.MeshStandardMaterial;
-      if (ent.slamFlashTimer > 0.5) {
-        mat.emissive.setHex(0xef4444);
-        mat.emissiveIntensity = 1.2;
-      } else if (ent.hitStunTimer > 0) {
-        mat.emissive.setHex(0x38bdf8);
-        mat.emissiveIntensity = 0.85;
-      } else {
-        mat.emissive.setHex(ent.kind === 'alien' ? 0x311042 : 0x000000);
-        mat.emissiveIntensity = ent.kind === 'alien' ? 0.35 : 0;
-      }
-
-      const hpRatio = Math.max(0.01, ent.hp / ent.maxHp);
-      vis.hpFillMesh.scale.set(hpRatio, 1, 1);
-
-      const entAlt = Math.max(0, ent.y - ent.floorY);
-      const showEntPlumb = ent.kind === 'alien' && (entAlt > 0.1 || this.room.gravityG === 0);
-      vis.plumbLine.visible = showEntPlumb;
-      vis.plumbRing.visible = showEntPlumb;
-      if (showEntPlumb) {
-        vis.plumbRing.position.set(ent.x, ent.floorY + 0.02, ent.z);
-        const eAttr = vis.plumbLine.geometry.getAttribute(
-          'position'
-        ) as THREE.BufferAttribute;
-        eAttr.setXYZ(0, ent.x, ent.floorY + 0.02, ent.z);
-        eAttr.setXYZ(1, ent.x, ent.y + 0.1, ent.z);
-        eAttr.needsUpdate = true;
-      }
-    }
-
-    for (const [id, vis] of this.entityVisuals.entries()) {
-      if (!activeIds.has(id)) {
-        this.scene.remove(vis.root, vis.plumbLine, vis.plumbRing);
-        this.disposeGroupResources(vis.root);
-        this.disposeGroupResources(vis.plumbLine);
-        this.disposeGroupResources(vis.plumbRing);
-        this.entityVisuals.delete(id);
-      }
-    }
-
-    if (this.lockOnTarget) {
-      this.lockReticleGroup.visible = true;
-      this.lockReticleGroup.position.set(
-        this.lockOnTarget.x,
-        this.lockOnTarget.y,
-        this.lockOnTarget.z
-      );
-      this.lockReticleGroup.rotation.y += dt * 4.5;
-
-      this.lockTargetPlumbLine.visible = true;
-      this.lockTargetPlumbRing.visible = true;
-
-      let targetFloorY = computeFloorAltitudeBelow(
-        this.room,
-        this.lockOnTarget.x,
-        this.lockOnTarget.y,
-        this.lockOnTarget.z,
-        0.25
-      );
-      if (this.lockOnTarget.kind === 'entity') {
-        const ent = this.room.entities.find(
-          (e) => e.id === this.lockOnTarget?.entityId
-        );
-        if (ent) targetFloorY = ent.floorY;
-      } else if (this.lockOnTarget.kind === 'vat') {
-        const vat = this.room.vats.find((v) => v.id === this.lockOnTarget?.vatId);
-        if (vat) targetFloorY = vat.y;
-      }
-
-      this.lockTargetPlumbRing.position.set(
-        this.lockOnTarget.x,
-        targetFloorY + 0.02,
-        this.lockOnTarget.z
-      );
-      const lAttr = this.lockTargetPlumbLine.geometry.getAttribute(
-        'position'
-      ) as THREE.BufferAttribute;
-      lAttr.setXYZ(
-        0,
-        this.lockOnTarget.x,
-        targetFloorY + 0.02,
-        this.lockOnTarget.z
-      );
-      lAttr.setXYZ(
-        1,
-        this.lockOnTarget.x,
-        this.lockOnTarget.y,
-        this.lockOnTarget.z
-      );
-      lAttr.needsUpdate = true;
-    } else {
-      this.lockReticleGroup.visible = false;
-      this.lockTargetPlumbLine.visible = false;
-      this.lockTargetPlumbRing.visible = false;
-    }
-
-    const burstCount = Math.min(32, this.room.airBursts.length);
-    for (let i = 0; i < burstCount; i++) {
-      const b = this.room.airBursts[i];
-      const base = i * 6;
-      this.airBurstPositions[base] = b.startX;
-      this.airBurstPositions[base + 1] = b.startY;
-      this.airBurstPositions[base + 2] = b.startZ;
-      this.airBurstPositions[base + 3] = b.endX;
-      this.airBurstPositions[base + 4] = b.endY;
-      this.airBurstPositions[base + 5] = b.endZ;
-    }
-    const burstAttr = this.airBurstMesh.geometry.getAttribute(
-      'position'
-    ) as THREE.BufferAttribute;
-    burstAttr.needsUpdate = true;
-    this.airBurstMesh.geometry.setDrawRange(0, burstCount * 2);
-  }
-
-  private onMouseMove(e: MouseEvent): void {
-    this.mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
-    this.mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
-  }
-
-  private onMouseDown(e: MouseEvent): void {
-    this.updateRaycastAndLockOn();
-    if (e.button === 0) {
-      fireCompressedAirNozzle(
-        this.room,
-        this.player,
-        this.input,
-        this.lockOnTarget
-      );
-      this.rebuildDirtyInstances();
-      this.updateHUD();
-    } else if (e.button === 2 && this.hoveredVoxel) {
-      const { x, y, z } = this.hoveredVoxel;
-      const idx = getVoxelIndex(this.room, x, y, z);
-
-      // If carving a voxel belonging to an intact Cylindrical Glass Vat, shatter the vat!
-      const struckVat = this.room.vats.find((v) => v.voxelIndices.includes(idx));
-      if (struckVat) {
-        const matName = MATERIAL_TABLE[struckVat.fluidMat].name;
-        shatterCylindricalVat(this.room, struckVat);
-        this.room.lastCombatLog = `Carved & breached Cylindrical ${matName} Vat — 12.0L released!`;
-      } else {
-        setVoxel(this.room, x, y, z, MaterialID.AIR, 0.0);
-        recountActiveCells(this.room);
-      }
-
-      this.rebuildDirtyInstances();
-      this.updateHUD();
-    }
-  }
-
-  private updateCameraFrustum(): void {
-    const aspect = window.innerWidth / window.innerHeight;
-    this.camera.left = -this.viewSize * aspect;
-    this.camera.right = this.viewSize * aspect;
-    this.camera.top = this.viewSize;
-    this.camera.bottom = -this.viewSize;
-    this.camera.updateProjectionMatrix();
-  }
-
-  private onWheel(e: WheelEvent): void {
-    this.viewSize = Math.max(5.2, Math.min(14.5, this.viewSize + e.deltaY * 0.005));
-    this.updateCameraFrustum();
-  }
-
-  private onKeyDown(e: KeyboardEvent): void {
-    this.keysPressed.add(e.code);
-    this.syncMovementKeys();
-
-    if (e.code === 'KeyQ' && !e.repeat) {
-      toggleRoomGravity(this.room, this.player);
-      this.rebuildDirtyInstances();
-      this.updateHUD();
-    } else if (e.code === 'Space' && !e.repeat) {
-      triggerPlayerDash(
-        this.room,
-        this.player,
-        this.input,
-        this.lockOnTarget
-      );
-    } else if (e.code === 'KeyF' && !e.repeat && this.placeVoxelCoords) {
-      const { x, y, z } = this.placeVoxelCoords;
-      if (this.selectedMaterial === MaterialID.WOOD_CRATE) {
-        spawnDynamicEntity(
-          this.room,
-          'crate',
-          (x + 0.5) * VOXEL_SIZE,
-          y * VOXEL_SIZE,
-          (z + 0.5) * VOXEL_SIZE
-        );
-      } else {
-        setVoxel(this.room, x, y, z, this.selectedMaterial, 1.0);
-      }
-      recountActiveCells(this.room);
-      this.rebuildDirtyInstances();
-      this.updateHUD();
-    } else if (e.code === 'KeyG' && !e.repeat && this.placeVoxelCoords) {
-      const { x, y, z } = this.placeVoxelCoords;
-      spawnDynamicEntity(
-        this.room,
-        'alien',
-        (x + 0.5) * VOXEL_SIZE,
-        y * VOXEL_SIZE,
-        (z + 0.5) * VOXEL_SIZE
-      );
-      this.updateHUD();
-    }
-
-    const keyMap: Record<string, MaterialID> = {
-      Digit1: MaterialID.HULL_STEEL,
-      Digit2: MaterialID.WOOD_CRATE,
-      Digit3: MaterialID.GLASS_VAT,
-      Digit4: MaterialID.WATER,
-      Digit5: MaterialID.OIL,
-      Digit6: MaterialID.CRYO,
-    };
-    if (keyMap[e.code] !== undefined) {
-      this.selectedMaterial = keyMap[e.code];
-      this.updateHUD();
-    }
-  }
-
-  private onKeyUp(e: KeyboardEvent): void {
-    this.keysPressed.delete(e.code);
-    this.syncMovementKeys();
-  }
-
-  private onResize(): void {
-    this.updateCameraFrustum();
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-  }
-
-  private updateHUD(): void {
-    const gravLabel =
-      this.room.gravityG > 0
-        ? '<span style="color:#4ade80">1G FLAT POOLS</span>'
-        : '<span style="color:#38bdf8">0G MID-AIR CLUSTERS</span>';
-    const lockStr = this.lockOnTarget
-      ? `<span style="color:#facc15">LOCKED: ${this.lockOnTarget.label}</span>`
-      : '<span style="color:#94a3b8">None (Hover within 14m & Line-of-Sight)</span>';
-
-    const matName = MATERIAL_TABLE[this.selectedMaterial].name;
-    const massBreakdown = `Total: <span style="color:#38bdf8">${this.room.totalFluidVolume.toFixed(
-      2
-    )}L</span> (Grid: ${this.room.gridFluidVolume.toFixed(
-      1
-    )}L | Vats: ${this.room.vatFluidVolume.toFixed(
-      1
-    )}L | Ice: ${this.room.iceVolume.toFixed(1)}L)`;
-
-    this.hudElement.innerHTML = `
-      <div><strong>SHIFT ALCHEMIST — Flat 1G Surface Pools, 0G Mid-Air Clusters & Falling Ice</strong></div>
-      <div>FPS: <span style="color:#4ade80">${this.fps}</span> | Gravity [Q]: <strong>${gravLabel}</strong> | ${massBreakdown}</div>
-      <div>3D Magnetic Lock-On: ${lockStr}</div>
-      <div>Combat Log: <span style="color:#fb923c">${this.room.lastCombatLog}</span></div>
-      <div style="color:#cbd5e1; font-size:11px; margin-top:3px;">
-        <strong>Test:</strong> [Q] 0G hovers mid-air (y=4..7) with zero orphan splits | Mid-air Ice falls in 1G | R-Click Vat shatters it!<br/>
-        <strong>Debug:</strong> [F] Spawn ${matName} [1-6] | [G] Spawn Alien | [R-Click] Carve
-      </div>
-    `;
+  public describeHit(hit: VoxelRayHit | null): string {
+    if (!hit) return 'none';
+    const name = MATERIAL_SPEC[hit.mat]?.name ?? `#${hit.mat}`;
+    return `${name} (${hit.x},${hit.y},${hit.z})`;
   }
 
   public render(): void {
-    const now = performance.now();
-    const dt = (now - this.lastFrameTime) / 1000;
-    this.lastFrameTime = now;
-
-    this.updateRaycastAndLockOn();
-    stepWorldPhysics(this.room, this.player, this.input, dt);
-    this.updateCameraAndVisuals(dt);
-
-    this.frameCount++;
-    if (now - this.lastFpsTime >= 350) {
-      this.fps = Math.round((this.frameCount * 1000) / (now - this.lastFpsTime));
-      this.frameCount = 0;
-      this.lastFpsTime = now;
-      this.updateHUD();
-    }
-
-    this.rebuildDirtyInstances();
     this.renderer.render(this.scene, this.camera);
   }
+
+  public getRoomBoundsM(): { w: number; h: number; d: number } {
+    return {
+      w: ARENA_W * VOXEL_SIZE_M,
+      h: ARENA_H * VOXEL_SIZE_M,
+      d: ARENA_D * VOXEL_SIZE_M,
+    };
+  }
+}
+
+export function getChunkCountCheck(): number {
+  return CHUNKS_X * CHUNKS_Y * CHUNKS_Z;
 }

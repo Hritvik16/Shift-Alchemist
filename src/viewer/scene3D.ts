@@ -173,6 +173,7 @@ export class Scene3D {
     });
     this.focusMarker = new THREE.Mesh(markerGeo, markerMat);
     this.focusMarker.castShadow = true;
+    this.focusMarker.visible = false;
     this.scene.add(this.focusMarker);
 
     // Cursor hover voxel outline

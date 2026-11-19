@@ -1,3 +1,4 @@
+import type { GravityMode } from '../core/balance.ts';
 import type { ConservationLedgers } from '../core/types.ts';
 
 export interface DebugMetrics {
@@ -6,15 +7,24 @@ export interface DebugMetrics {
   p99Ms: number;
   simMs: number;
   renderMs: number;
+  simTick: number;
   drawCalls: number;
   triangles: number;
   meshedChunks: number;
   dirtyQueue: number;
   meshMemMB: number;
   decalCount: number;
-  focusX: number;
-  focusY: number;
-  focusZ: number;
+  playerX: number;
+  playerY: number;
+  playerZ: number;
+  playerVy: number;
+  upSign: 1 | -1;
+  grounded: boolean;
+  gravityMode: GravityMode;
+  plumbDistM: number;
+  lastImpactV: number;
+  lastSplatDmg: number;
+  lastImpactExempt: boolean;
   hoveredInfo: string;
   ledgers: ConservationLedgers;
 }
@@ -36,10 +46,10 @@ export class DebugOverlay {
       'padding:10px 12px',
       'color:#d8e8f8',
       'font-size:12px',
-      'line-height:1.45',
+      'line-height:1.42',
       'pointer-events:none',
       'white-space:pre',
-      'min-width:290px',
+      'min-width:305px',
     ].join(';');
     parent.appendChild(this.el);
   }
@@ -51,19 +61,24 @@ export class DebugOverlay {
 
   public update(m: DebugMetrics): void {
     if (!this.visible) return;
+    const impTag =
+      m.lastImpactV > 0
+        ? `${m.lastImpactV.toFixed(1)} m/s -> ${m.lastSplatDmg} dmg${m.lastImpactExempt ? ' (exempt)' : ''}`
+        : 'none';
     this.el.textContent =
-      `SHIFT ALCHEMIST v2 [M1.1 Cargo Hold]\n` +
+      `SHIFT ALCHEMIST v2 [M1.2 Controller]\n` +
       `FPS: ${m.fps.toFixed(1)} | p95: ${m.p95Ms.toFixed(2)}ms | p99: ${m.p99Ms.toFixed(2)}ms\n` +
-      `Sim: ${m.simMs.toFixed(2)}ms | Render: ${m.renderMs.toFixed(2)}ms\n` +
+      `Sim: ${m.simMs.toFixed(2)}ms | Render: ${m.renderMs.toFixed(2)}ms | Tick: ${m.simTick}\n` +
       `Draw Calls: ${m.drawCalls} | Tris: ${m.triangles.toLocaleString()}\n` +
-      `Chunks Meshed: ${m.meshedChunks} | Dirty Q: ${m.dirtyQueue}\n` +
-      `Mesh Mem: ${m.meshMemMB.toFixed(2)} / 48.00 MB | Decals: ${m.decalCount} / 512\n` +
-      `Focus: (${m.focusX.toFixed(1)}, ${m.focusY.toFixed(1)}, ${m.focusZ.toFixed(1)}) m\n` +
-      `Hover: ${m.hoveredInfo}\n` +
+      `Chunks: ${m.meshedChunks} | Dirty Q: ${m.dirtyQueue} | Mem: ${m.meshMemMB.toFixed(2)}MB\n` +
+      `Pos: (${m.playerX.toFixed(2)}, ${m.playerY.toFixed(2)}, ${m.playerZ.toFixed(2)}) vy=${m.playerVy.toFixed(1)}\n` +
+      `Grav: ${m.gravityMode} | upSign=${m.upSign > 0 ? '+1' : '-1'} | Grounded=${m.grounded ? 'Y' : 'N'} | Plumb=${m.plumbDistM.toFixed(2)}m\n` +
+      `Last Impact: ${impTag}\n` +
+      `Hover: ${m.hoveredInfo} | Decals: ${m.decalCount}/512\n` +
       `Ledgers (L): W=${m.ledgers.water} O=${m.ledgers.oil} C=${m.ledgers.cryo} A=${m.ledgers.acid}\n` +
-      `─────────────────────────────────────\n` +
-      `WASD: Pan Focus | E/Shift: Focus +/-Y\n` +
-      `Wheel: Zoom | 1-6: Carve Sphere | LMB: Damage\n` +
-      `F3: Toggle Overlay`;
+      `───────────────────────────────────────\n` +
+      `WASD: Move | E/Shift: 0G +/-Y | Wheel: Zoom\n` +
+      `Q: 1G<->0G / Cancel | C: 2G (3s) | V: -1G (3.5s)\n` +
+      `1-6: Carve | LMB: Damage | F3: Overlay`;
   }
 }

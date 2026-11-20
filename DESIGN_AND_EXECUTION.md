@@ -4,6 +4,8 @@
 
 ---
 
+> **STATUS (2026-11-20): Tier A COMPLETE** (`M1.1`, `M1.2`, `M1.3-lite`, `M2.1`, `M3.1`, `M2.2-lite`; `44/44` `node:test` invariants passing, `Drift=0`, `60.0 FPS` on 8GB M1 Air). Read **§11 Tier A Playtest Overrides & Tier B Handoff** before editing any Tier A constants, reactions, or VFX—those finalized values supersede earlier draft numbers in §2–§10.
+
 ## 1. High-Concept Pitch
 **Shift Alchemist** is a 3D isometric action roguelite set aboard a derelict industrial freighter overrun by procedurally mutated Xenomorphs. Armed with a **Pressurized Fluid Nozzle**, a **Vacuum Siphon**, a **Fluid-Plumbed Jetpack**, and a **Local Gravity-Shift Pulse**, the player manipulates a real-time **10 cm (`0.1 m`) 3D cellular automata and ballistic particle sandbox** of **Water, Oil, Cryo-Coolant, Acid, Fire, Steam, Electricity, Wood, Ice, Glass, and Steel**—turning the ship's failing gravity and volatile cargo into kinetic and elemental chain reactions modeled after *Noita* and *Teardown*.
 
@@ -471,6 +473,31 @@ The full plan (Phases 1–4) is still more than this. The tiers below decide wha
   * *Playtest Gate:* Complete a full 5–8 minute multi-room run from Arrival Airlock to Boss defeat, verifying seamless backtracking with 100% conserved carved walls/puddles, `< 350 MB` total tab memory, and locked `60 FPS`.
 
 ---
+
+## 11. Tier A Playtest Overrides & Tier B Handoff (2026-11-20)
+
+All Tier A milestones (`M1.1`, `M1.2`, `M1.3-lite`, `M2.1`, `M3.1`, `M2.2-lite`) are complete, verified by `44/44` passing `node:test` invariants (`npm test`) with `Drift=0`, and playtested at a locked `60.0 FPS`. The overrides below were tuned during browser playtesting and **supersede earlier draft values** in §2–§10:
+
+### 11.1 Weapon Ranges, Nozzle Speeds & Aiming (§2 / §5 / §8)
+- **Compressed Air Burst (empty tank):** `AIR_BURST_RANGE_M = 4.0` m (mid-range melee shove; cone VFX scaled to match).
+- **Loaded Fluid Nozzle:** `NOZZLE_TAP_SPEED_M_S = 10.0` m/s, `NOZZLE_HOLD_SPEED_M_S = 9.0` m/s.
+- **Lock-On:** `LOCKON_RANGE_M = 7.5` m, `LOCKON_CURSOR_SNAP_M = 0.8` m (tight cursor snap prevents nearby vats/crates from hijacking floor or vent aim).
+- **Default Unlocked Aiming:** Raycasts the exact hovered 3D voxel (`pickVoxel`) and solves a low-angle gravity-compensated ballistic pitch (`computeBallisticAimDir` in `src/core/combat.ts`) when the tank is loaded. Rendered with a diegetic parabolic trajectory arc, splash landing ring, and `0G` altitude drop-line (`src/viewer/playerRig.ts`).
+- **Controller Note (Deferred):** Future gamepad support should feed the same `InputFrame` (`aimPoint` + `aimDir`) via `stickMagnitude * effectiveRange` with a narrow directional cone assist.
+
+### 11.2 Fire Propagation, Thermal Vent & Phase Explosions (§6 / §9)
+- **Fuel-Anchored `FIRE` (`src/core/fluids.ts`):** `FIRE` stays anchored while 6-adjacent to `OIL` or `WOOD_BARRIER` (`timer > 20`) and rises/drifts at `30 Hz` when detached, enabling clean floor oil-slick chain-ignition (`OIL`/`WOOD_BARRIER` still strictly require adjacent `AIR`).
+- **Thermal Steam Vent (`src/core/reactions.ts`):** Heats a `5×3×5` floor base collar (`y = em.y..em.y+2`) for quiet deck simmering into `STEAM` (no popcorn-bouncing puddles) plus a `3×10×3` vertical plume (`y = em.y+3..em.y+12`). Cap/plume contact triggers Phase Explosions with a `15`-tick (`0.25 s`) per-emitter debounce.
+- **Stage 6 Droplet Scatter:** Capped at `20` surface droplets within `1.1 m` pushed outward (preventing vertical puddle-bouncing loops).
+- **Shattered `ICE` Shrapnel (`types.ts`, `combat.ts`, `reactions.ts`, `fluids.ts`):** `applyStructuralDamage` launches shattered `Ballistic(ICE)` outward and upward (`7.5–11 m/s` forward+up on Air Burst; radial on Phase Explosion). High-speed `ICE` shards (`>= 4.0 m/s`) deal `4` kinetic damage (`3×` if target is embrittled) while maintaining `0` water ledger drift.
+
+### 11.3 Volumetric Explosion VFX Contract (`src/viewer/entityRenderer.ts`)
+- `ExplosionWave` and `ExplosionVisualEvent` carry `kind: 'steam' | 'cryo'`.
+- **No geometric ground rings.** Blasts render as a single-draw-call `InstancedMesh` of true `0.1 m` (`VOXEL_SIZE_M`) volumetric vapor cubes (`96` cubes/blast across 3 concentric shells; steam white/gray vs. cryo frost/cyan palettes) with **gravity-coupled buoyancy** (rises in `1G`/`2G`/`3G`, hangs as a 3D sphere in `0G`, sinks toward deck in `-1G`), paired with a `0.14 m` core flash, shared dynamic `PointLight` pulse, and distance-scaled camera micro-shake.
+
+### 11.4 Active Boundary: Tier A -> Tier B
+- **Completed:** Single-room Cargo Hold loop (`6` Brood Pods, `6` crates, `4` vats, Thermal Vent, full fluid CA, `15 Hz` thermal/phase reactions, Starter Tank/Siphon/Nozzle/Dash, clear banner & seed restart).
+- **Next Up (Tier B):** Procedural multi-room deck generator, RLE airlock room transitions, Workbench upgrade terminals (Baffled Tank & suit ranks), mobile enemy archetypes, and Web Audio SFX / itch.io polish.
 
 ## Audit changelog
 

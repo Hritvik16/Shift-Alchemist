@@ -57,7 +57,7 @@ interface VentVisual {
 }
 
 const MAX_BLASTS = 16;
-const BLAST_VOXELS_PER_EVENT = 28;
+const BLAST_VOXELS_PER_EVENT = 96;
 const MAX_BLAST_INSTANCES = MAX_BLASTS * BLAST_VOXELS_PER_EVENT;
 
 const STEAM_PALETTE = [0xffffff, 0xeef5fc, 0xd8e6f2, 0xc4d6e6] as const;
@@ -161,7 +161,7 @@ export class EntityRenderer {
     scene.add(this.airCone);
 
     // Shared 1-draw-call InstancedMesh for volumetric steam/cryo vapor voxel bursts
-    const voxelGeo = new THREE.BoxGeometry(0.22, 0.22, 0.22);
+    const voxelGeo = new THREE.BoxGeometry(VOXEL_SIZE_M, VOXEL_SIZE_M, VOXEL_SIZE_M);
     const voxelMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: 0.88,
@@ -180,7 +180,7 @@ export class EntityRenderer {
     scene.add(this.blastLight);
 
     // Pre-allocated volumetric blast pool (snappy pressure core + 28 voxel cubes each)
-    const coreGeo = new THREE.BoxGeometry(0.48, 0.48, 0.48);
+    const coreGeo = new THREE.BoxGeometry(VOXEL_SIZE_M * 1.4, VOXEL_SIZE_M * 1.4, VOXEL_SIZE_M * 1.4);
     for (let i = 0; i < MAX_BLASTS; i++) {
       const coreMat = new THREE.MeshBasicMaterial({
         color: 0xffffff,
@@ -491,20 +491,25 @@ export class EntityRenderer {
         const horizR = Math.sqrt(Math.max(0.02, 1 - yDir * yDir));
         const theta = v * goldenAngle + (ev.tick & 31) * 0.21;
 
-        // Radial speed tuned against drag k=5.5 so outer shell reaches ~1.8 m cleanly
-        const shellFactor = v < 18 ? 0.78 + (v % 4) * 0.1 : 0.42 + (v % 3) * 0.12;
+        // 3 concentric shells of true 0.1 m vapor voxels expanding out to ~1.8 m
+        const shellFactor =
+          v < 48
+            ? 0.78 + (v % 4) * 0.08
+            : v < 78
+              ? 0.46 + (v % 4) * 0.08
+              : 0.18 + (v % 3) * 0.08;
         const speed = ev.radiusM * 5.6 * shellFactor;
 
-        vox.x = ev.x + Math.cos(theta) * horizR * 0.14;
-        vox.y = ev.y + Math.max(0.08, yDir * 0.14 + 0.1);
-        vox.z = ev.z + Math.sin(theta) * horizR * 0.14;
+        vox.x = ev.x + Math.cos(theta) * horizR * 0.1;
+        vox.y = ev.y + Math.max(0.06, yDir * 0.1 + 0.08);
+        vox.z = ev.z + Math.sin(theta) * horizR * 0.1;
         vox.vx = Math.cos(theta) * horizR * speed;
         vox.vy = yDir * speed;
         vox.vz = Math.sin(theta) * horizR * speed;
         vox.rx = theta;
         vox.ry = frac * Math.PI;
-        vox.rotSpeed = (v & 1 ? 1 : -1) * (2.5 + (v % 4) * 1.1);
-        vox.baseScale = v < 18 ? 0.85 + (v % 3) * 0.22 : 1.15 + (v % 3) * 0.28;
+        vox.rotSpeed = (v & 1 ? 1 : -1) * (3.0 + (v % 4) * 1.2);
+        vox.baseScale = 0.8 + (v % 3) * 0.15;
         vox.colorHex = palette[v % palette.length];
         vox.lifeScale = 0.78 + (v % 5) * 0.06;
       }
@@ -547,7 +552,7 @@ export class EntityRenderer {
       const coreT = b.age / 0.1;
       if (coreT < 1) {
         b.coreMesh.visible = true;
-        const cs = 0.55 + 1.55 * coreT;
+        const cs = 0.8 + 0.7 * coreT;
         b.coreMesh.scale.setScalar(cs);
         b.coreMesh.rotation.y += 4.0 * dt;
         b.coreMat.opacity = 0.85 * (1 - coreT);
@@ -576,7 +581,7 @@ export class EntityRenderer {
         vox.ry += vox.rotSpeed * 0.7 * dt;
 
         // Swell rapidly during pressure expansion (0..0.32), then shrink cleanly to 0
-        const env = vt < 0.32 ? 0.55 + (vt / 0.32) * 0.75 : Math.max(0, 1.3 * (1 - (vt - 0.32) / 0.68));
+        const env = vt < 0.28 ? 1.0 : Math.max(0, 1.0 - (vt - 0.28) / 0.72);
         const sc = vox.baseScale * env;
         if (sc <= 0.02) continue;
 

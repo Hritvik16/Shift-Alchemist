@@ -34,7 +34,6 @@ import {
   stepFluidMovementStage4,
   stepFluidStage8,
   stepMinimalCryoWarming,
-  triggerZeroGLift,
 } from './fluids.ts';
 import {
   getEffectiveMassKg,
@@ -498,10 +497,6 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
 
   // Process vat shatters & 1G->0G lift before ballistic integration
   processPendingVatShatters(world);
-  if (world.justEnteredZeroGLiftDir !== 0) {
-    triggerZeroGLift(world, world.justEnteredZeroGLiftDir);
-    world.justEnteredZeroGLiftDir = 0;
-  }
   if (world.gravityChangedThisTick) {
     reseedActiveLists(world.room, world.simTick);
     world.gravityChangedThisTick = false;

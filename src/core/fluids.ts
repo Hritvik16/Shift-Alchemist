@@ -9,8 +9,7 @@ import {
   GRAVITY_MODE,
   LIFT_0G_DRAG,
   LIFT_0G_STOP_SPEED,
-  LIFT_0G_VEL_MAX,
-  LIFT_0G_VEL_MIN,
+  LIFT_0G_TICKS,
   MAT,
   MATERIAL_SPEC,
   MAX_ACTIVE_BALLISTIC,
@@ -626,92 +625,6 @@ export function processPendingVatShatters(world: WorldState): void {
   room.pendingVatShatters.length = 0;
 }
 
-/**
- * 1G -> 0G Lift (§6.2):
- * Scans top-surface liquid cells (AIR along liftDirY = -oldDirY), sorts ascending distance from player,
- * and promotes up to pool capacity at vy = 2.2..3.4 m/s.
- */
-export function triggerZeroGLift(world: WorldState, liftDirY: 1 | -1): void {
-  const room = world.room;
-  if (room.ballistic.count >= MAX_ACTIVE_BALLISTIC) return;
-
-  const candidates: number[] = [];
-  const g = room.grid;
-  const W = room.roomW;
-  const H = room.roomH;
-  const D = room.roomD;
-
-  for (let y = 1; y < H - 1; y++) {
-    const ay = y + liftDirY;
-    if (ay < 1 || ay >= H - 1) continue;
-    const yOff = y * SLICE_STRIDE;
-    const ayOff = ay * SLICE_STRIDE;
-    for (let z = 1; z < D - 1; z++) {
-      const row = yOff + z * ARENA_W;
-      const aRow = ayOff + z * ARENA_W;
-      for (let x = 1; x < W - 1; x++) {
-        const idx = row + x;
-        if (!isLiquidMat(getMat(g[idx]))) continue;
-        if (getMat(g[aRow + x]) === MAT.AIR) {
-          candidates.push(idx);
-        }
-      }
-    }
-  }
-
-  if (candidates.length === 0) return;
-
-  const px = world.player.x / VOXEL_SIZE_M;
-  const py = world.player.y / VOXEL_SIZE_M;
-  const pz = world.player.z / VOXEL_SIZE_M;
-
-  candidates.sort((a, b) => {
-    const ay = Math.floor(a / SLICE_STRIDE);
-    const aRem = a - ay * SLICE_STRIDE;
-    const az = Math.floor(aRem / ARENA_W);
-    const ax = aRem - az * ARENA_W;
-
-    const by = Math.floor(b / SLICE_STRIDE);
-    const bRem = b - by * SLICE_STRIDE;
-    const bz = Math.floor(bRem / ARENA_W);
-    const bx = bRem - bz * ARENA_W;
-
-    const da = (ax - px) * (ax - px) + (ay - py) * (ay - py) + (az - pz) * (az - pz);
-    const db = (bx - px) * (bx - px) + (by - py) * (by - py) + (bz - pz) * (bz - pz);
-    return da !== db ? da - db : a - b;
-  });
-
-  const airVal = packVoxel(MAT.AIR, TEMP_BYTE.AMBIENT);
-  for (let i = 0; i < candidates.length; i++) {
-    if (room.ballistic.count >= MAX_ACTIVE_BALLISTIC) break;
-    const idx = candidates[i];
-    const y = Math.floor(idx / SLICE_STRIDE);
-    const rem = idx - y * SLICE_STRIDE;
-    const z = Math.floor(rem / ARENA_W);
-    const x = rem - z * ARENA_W;
-    const val = g[idx];
-
-    const h = hash32(room.roomSeed, world.simTick, idx);
-    const speed =
-      LIFT_0G_VEL_MIN + (LIFT_0G_VEL_MAX - LIFT_0G_VEL_MIN) * ((h & 1023) / 1023);
-
-    const slot = spawnBallistic(
-      room,
-      (x + 0.5) * VOXEL_SIZE_M,
-      (y + 0.5) * VOXEL_SIZE_M,
-      (z + 0.5) * VOXEL_SIZE_M,
-      0,
-      liftDirY * speed,
-      0,
-      val,
-    );
-    if (slot !== -1) {
-      writeCell(room, x, y, z, airVal, world.simTick);
-      wake26Neighbors(room, x, y, z, world.simTick);
-    }
-  }
-}
-
 function applyBallisticImpactTransitionOrPlace(
   world: WorldState,
   slot: number,
@@ -1238,6 +1151,22 @@ function stepSingleFluidSubPass(
             break;
           }
         }
+      } else if (world.zeroGLoftTicksLeft > 0) {
+        // CA-driven room-wide 0G loft (§6.2, D6): 0 ballistic slots consumed
+        const liftDir = world.zeroGLoftDirY;
+        const threshold = Math.floor((world.zeroGLoftTicksLeft / LIFT_0G_TICKS) * 460);
+        const h = hash32(room.roomSeed, simTick, idx) & 1023;
+        const ny = y + liftDir;
+        if (h < threshold && ny >= 1 && ny < room.roomH - 1) {
+          if (getMat(g[cellIndex(x, ny, z)]) === MAT.AIR) {
+            moveCell(room, x, y, z, x, ny, z, simTick);
+            movedToIdx = cellIndex(x, ny, z);
+          }
+        }
+        // Keep liquid awake across the loft window so every cell rolls each tick
+        if (movedToIdx === -1) {
+          wakeCell(room, x, y, z, simTick);
+        }
       } else {
         // 0G Surface Tension (§6.3): interior cells early-exit
         let allSixMatch = true;
@@ -1584,15 +1513,26 @@ export function stepFluidMovementStage4(world: WorldState): void {
   const room = world.room;
   swapActiveListsAtStage4(room);
 
-  const count = room.activeFluidCurCount;
-  if (count === 0) return;
-
   const mode = room.gravityMode;
+  const count = room.activeFluidCurCount;
+  if (count === 0) {
+    if (mode === GRAVITY_MODE.G0 && world.zeroGLoftTicksLeft > 0) {
+      world.zeroGLoftTicksLeft--;
+    }
+    return;
+  }
+
   const passes = mode === GRAVITY_MODE.G3 ? 3 : mode === GRAVITY_MODE.G2 ? 2 : 1;
-  const ascending = mode !== GRAVITY_MODE.GN1;
+  const ascending =
+    mode === GRAVITY_MODE.G0 && world.zeroGLoftTicksLeft > 0
+      ? world.zeroGLoftDirY < 0
+      : mode !== GRAVITY_MODE.GN1;
 
   if (passes === 1) {
     stepSingleFluidSubPass(world, room.activeFluidCur, count, ascending, null);
+    if (mode === GRAVITY_MODE.G0 && world.zeroGLoftTicksLeft > 0) {
+      world.zeroGLoftTicksLeft--;
+    }
     return;
   }
 

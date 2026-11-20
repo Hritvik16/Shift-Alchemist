@@ -283,38 +283,60 @@ describe('Milestone 2.1 — Fluid CA, Ballistics, Grates, Halo & Conservation', 
     recomputeRoomLedgers(room);
     assert.equal(room.ledgers.water, startWater, '0 water ledger drift during 1-voxel drain');
   });
-  it('integrates actual 0G loft height strictly within [0.62, 1.02] m via stepBallisticsStage3', () => {
+  it('lofts puddles room-wide across opposite corners in 0G via CA using 0 ballistic slots', () => {
     const world = makeCargoWorld();
     const room = world.room;
-    // Place 10 exposed WATER cells on the deck and trigger 1G -> 0G
-    for (let i = 0; i < 10; i++) {
-      writeCell(room, 100 + i * 2, CARGO_DECK_TOP_Y, 50, packVoxel(MAT.WATER, TEMP_BYTE.AMBIENT), 1);
+    // Place two distant 4x4 puddles on opposite corners of the 24x24 m Cargo Hold
+    for (let dz = 0; dz < 4; dz++) {
+      for (let dx = 0; dx < 4; dx++) {
+        writeCell(room, 60 + dx, CARGO_DECK_TOP_Y, 40 + dz, packVoxel(MAT.WATER, TEMP_BYTE.AMBIENT), 1);
+        writeCell(room, 180 + dx, CARGO_DECK_TOP_Y, 190 + dz, packVoxel(MAT.WATER, TEMP_BYTE.AMBIENT), 1);
+      }
     }
-    const startY = (CARGO_DECK_TOP_Y + 0.5) * 0.1;
+    recomputeRoomLedgers(room);
+    const startWater = room.ledgers.water;
+
     const pressQ = createEmptyInput();
     pressQ.pressQ = true;
     stepWorldTick(world, pressQ);
 
-    let maxLoft = 0;
-    let minFinalLoft = Infinity;
-    const peakBySlot = new Float32Array(4096);
-    for (let t = 0; t < 60; t++) {
-      for (let s = 0; s < 4096; s++) {
-        if (room.ballistic.active[s]) {
-          const h = room.ballistic.y[s] - startY;
-          if (h > peakBySlot[s]) peakBySlot[s] = h;
-        }
-      }
+    for (let t = 0; t < 45; t++) {
+      assert.equal(room.ballistic.count, 0, '0G loft must use 0 ballistic slots');
       stepWorldTick(world, createEmptyInput());
     }
-    for (let s = 0; s < 4096; s++) {
-      if (peakBySlot[s] > 0) {
-        if (peakBySlot[s] > maxLoft) maxLoft = peakBySlot[s];
-        if (peakBySlot[s] < minFinalLoft) minFinalLoft = peakBySlot[s];
+
+    let nwSumY = 0;
+    let nwCount = 0;
+    let seSumY = 0;
+    let seCount = 0;
+    for (let y = CARGO_DECK_TOP_Y; y < CARGO_DECK_TOP_Y + 20; y++) {
+      for (let z = 36; z <= 48; z++) {
+        for (let x = 56; x <= 68; x++) {
+          if (getMat(room.grid[cellIndex(x, y, z)]) === MAT.WATER) {
+            nwSumY += (y - CARGO_DECK_TOP_Y) * 0.1;
+            nwCount++;
+          }
+        }
+      }
+      for (let z = 186; z <= 198; z++) {
+        for (let x = 176; x <= 188; x++) {
+          if (getMat(room.grid[cellIndex(x, y, z)]) === MAT.WATER) {
+            seSumY += (y - CARGO_DECK_TOP_Y) * 0.1;
+            seCount++;
+          }
+        }
       }
     }
-    assert.ok(minFinalLoft >= 0.615, `min loft too low: ${minFinalLoft}`);
-    assert.ok(maxLoft <= 1.03, `max loft too high: ${maxLoft}`);
+
+    assert.equal(nwCount, 16);
+    assert.equal(seCount, 16);
+    const nwMean = nwSumY / nwCount;
+    const seMean = seSumY / seCount;
+    assert.ok(nwMean >= 0.55 && nwMean <= 1.1, `NW puddle loft out of range: ${nwMean}`);
+    assert.ok(seMean >= 0.55 && seMean <= 1.1, `SE puddle loft out of range: ${seMean}`);
+
+    recomputeRoomLedgers(room);
+    assert.equal(room.ledgers.water, startWater, '0 water ledger drift during room-wide 0G loft');
   });
 
   it('lets water trapped in the intact bottom basin of a cracked vat settle to 0 active cells', () => {

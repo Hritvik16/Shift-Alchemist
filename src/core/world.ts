@@ -2,6 +2,7 @@ import {
   GRAV_CRUSH_S,
   GRAV_INVERT_S,
   GRAVITY_MODE,
+  LIFT_0G_TICKS,
   MAT,
   MATERIAL_SPEC,
   PLAYER_AABB_D,
@@ -110,7 +111,8 @@ export interface WorldState {
   playerTank: PlayerTankState;
   gravityPulse: GravityPulseState;
   impactTelemetry: ImpactTelemetry;
-  justEnteredZeroGLiftDir: -1 | 0 | 1;
+  zeroGLoftTicksLeft: number;
+  zeroGLoftDirY: -1 | 1;
   gravityChangedThisTick: boolean;
   entryLedgers: ConservationLedgers;
   room: RoomState;
@@ -212,7 +214,8 @@ export function createWorldState(runSeed: number): WorldState {
       lastImpactExempt: false,
       lastImpactTick: -1,
     },
-    justEnteredZeroGLiftDir: 0,
+    zeroGLoftTicksLeft: 0,
+    zeroGLoftDirY: 1,
     gravityChangedThisTick: false,
     entryLedgers: { water: 0, oil: 0, cryo: 0, acid: 0, oilCombusted: 0, cryoBoiledOff: 0, acidConsumed: 0 },
     room: createEmptyRoomState(seed),
@@ -296,7 +299,8 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
       world.room.gravityMode =
         prevMode === GRAVITY_MODE.G0 ? GRAVITY_MODE.G1 : GRAVITY_MODE.G0;
       if (world.room.gravityMode === GRAVITY_MODE.G0 && prevMode !== GRAVITY_MODE.G0) {
-        world.justEnteredZeroGLiftDir = prevMode === GRAVITY_MODE.GN1 ? -1 : 1;
+        world.zeroGLoftTicksLeft = LIFT_0G_TICKS;
+        world.zeroGLoftDirY = prevMode === GRAVITY_MODE.GN1 ? -1 : 1;
       }
       world.player.upSign = 1;
       gp.cooldownTicks = cdTicks;
@@ -327,6 +331,9 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
 
   if (world.room.gravityMode !== prevGravityMode) {
     world.gravityChangedThisTick = true;
+    if (world.room.gravityMode !== GRAVITY_MODE.G0) {
+      world.zeroGLoftTicksLeft = 0;
+    }
   }
   world.player.upSign = world.room.gravityMode === GRAVITY_MODE.GN1 ? -1 : 1;
 }

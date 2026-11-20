@@ -207,6 +207,7 @@ export const LIFT_0G_VEL_MIN = 2.2;
 export const LIFT_0G_VEL_MAX = 3.4;
 export const LIFT_0G_DRAG = 0.95;
 export const LIFT_0G_STOP_SPEED = 0.35;
+export const LIFT_0G_TICKS = 36;
 
 export function simulateZeroGLoft(v0: number): {
   heightM: number;

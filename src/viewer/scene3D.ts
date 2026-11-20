@@ -83,6 +83,8 @@ export class Scene3D {
   private readonly tmpMat4 = new THREE.Matrix4();
   private readonly raycaster = new THREE.Raycaster();
   private readonly mouseNdc = new THREE.Vector2();
+  private readonly aimPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  private readonly aimHit = new THREE.Vector3();
   private dirtySortBuf: number[] = [];
 
   constructor(container: HTMLElement) {
@@ -104,7 +106,6 @@ export class Scene3D {
     const aspect = Math.max(1, container.clientWidth) / Math.max(1, container.clientHeight);
     this.camera = new THREE.PerspectiveCamera(36, aspect, 0.5, 120);
 
-    // Lighting (1 Directional Shadow Pass + ambient hemisphere fill)
     const hemi = new THREE.HemisphereLight(0xb8d8ff, 0x3b4254, 0.95);
     this.scene.add(hemi);
 
@@ -124,7 +125,6 @@ export class Scene3D {
     this.scene.add(sun);
     this.scene.add(sun.target);
 
-    // 3 BatchedMesh solid buckets
     const opaqueMat = this.createVoxelMaterial({
       transparent: false,
       roughness: 0.78,
@@ -153,7 +153,6 @@ export class Scene3D {
       this.createBucketPool(SOLID_BUCKET.GRATE, grateMat, true, true, false),
     ];
 
-    // Damage decals (capped at MAX_DAMAGE_DECALS = 512)
     const decalGeo = new THREE.BoxGeometry(0.105, 0.105, 0.105);
     const decalMat = new THREE.MeshBasicMaterial({
       color: 0x120a08,
@@ -167,7 +166,6 @@ export class Scene3D {
     this.decalMesh.frustumCulled = false;
     this.scene.add(this.decalMesh);
 
-    // Focus probe marker (represents future player torso for sightline cutaway verification)
     const markerGeo = new THREE.CylinderGeometry(0.28, 0.28, 1.5, 16);
     const markerMat = new THREE.MeshStandardMaterial({
       color: 0x3be8b0,
@@ -180,7 +178,6 @@ export class Scene3D {
     this.focusMarker.visible = false;
     this.scene.add(this.focusMarker);
 
-    // Cursor hover voxel outline
     const boxEdges = new THREE.EdgesGeometry(new THREE.BoxGeometry(0.11, 0.11, 0.11));
     this.hoverBox = new THREE.LineSegments(
       boxEdges,
@@ -190,7 +187,7 @@ export class Scene3D {
     this.scene.add(this.hoverBox);
 
     const normGeo = new THREE.BufferGeometry();
-    normGeo.setAttribute("position", new THREE.BufferAttribute(this.hoverNormalPositions, 3));
+    normGeo.setAttribute('position', new THREE.BufferAttribute(this.hoverNormalPositions, 3));
     this.hoverNormalLine = new THREE.Line(
       normGeo,
       new THREE.LineBasicMaterial({ color: 0xff595e }),
@@ -198,7 +195,6 @@ export class Scene3D {
     this.hoverNormalLine.visible = false;
     this.scene.add(this.hoverNormalLine);
 
-    // Visual North airlock blast door overlay
     const doorGeo = new THREE.BoxGeometry(3.0, 2.8, 0.14);
     const doorMat = new THREE.MeshStandardMaterial({
       color: 0x263244,
@@ -260,7 +256,7 @@ export class Scene3D {
       metalness: opts.metalness,
       transparent: opts.transparent,
       depthWrite: !opts.transparent,
-      side: opts.transparent ? THREE.FrontSide : THREE.FrontSide,
+      side: THREE.FrontSide,
     });
 
     const uniforms = this.cutawayUniforms;
@@ -333,14 +329,12 @@ export class Scene3D {
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>
-           // Subtle 10 cm Noita/Teardown voxel shimmer
            vec3 cellCoord = floor(vVoxelWorldPos * 10.0 - vVoxelWorldNormal * 0.05);
            float sh = voxelHash(cellCoord);
            diffuseColor.rgb *= (0.92 + 0.16 * sh);
            ${
              isGrate
                ? `
-           // Selective-permeable steel grate openings on horizontal faces
            if (abs(vVoxelWorldNormal.y) > 0.5) {
              vec2 gSub = fract(vVoxelWorldPos.xz * 15.0);
              if (gSub.x > 0.24 && gSub.x < 0.76 && gSub.y > 0.24 && gSub.y < 0.76) {
@@ -352,7 +346,6 @@ export class Scene3D {
            ${
              enableCutaway
                ? `
-           // Surgical sightline X-ray cutaway for overhanging catwalk/pillars above focus
            if (vVoxelWorldPos.y > uFocusPos.y + 1.55) {
              vec3 toFocus = (uFocusPos + vec3(0.0, 0.8, 0.0)) - uCamPos;
              float rayLen = length(toFocus);
@@ -387,7 +380,6 @@ export class Scene3D {
   }
 
   public updateCamera(): void {
-    // Fixed 45° yaw (South-East -> North-West) and 48° pitch (§5)
     const pitchRad = (48 * Math.PI) / 180;
     const dy = this.zoomDist * Math.sin(pitchRad);
     const dh = this.zoomDist * Math.cos(pitchRad);
@@ -453,7 +445,6 @@ export class Scene3D {
       if (!hasMesh) continue;
       const dSq = this.chunkDistSq(c);
       const lastUsed = this.chunkLastUsed[c];
-      // Distance-prioritized LRU: evict farthest chunk; break close distance ties by oldest chunkLastUsed
       if (
         dSq > bestDistSq + 1.0 ||
         (Math.abs(dSq - bestDistSq) <= 1.0 && lastUsed < oldestUsed)
@@ -489,7 +480,6 @@ export class Scene3D {
     const bytes = verts * pool.bytesPerVert + indices * 4;
     const capBytes = MAX_MESH_MEM_MB * 1024 * 1024;
 
-    // Enforce 48 MB LRU/distance cap and bucket capacity
     let guard = 0;
     while (
       guard < 64 &&
@@ -509,7 +499,6 @@ export class Scene3D {
     try {
       geoId = pool.mesh.addGeometry(geo);
     } catch {
-      // Compact fragmented deleted geometry slots and retry once
       pool.mesh.optimize();
       geoId = pool.mesh.addGeometry(geo);
     }
@@ -545,10 +534,6 @@ export class Scene3D {
     return dx * dx + dy * dy + dz * dz;
   }
 
-  /**
-   * Distance-prioritized solid chunk remeshing (Stage 9).
-   * If timeBudgetMs > 0 (initial load / paused airlock), meshes until budget expires.
-   */
   public processDirtyMeshes(room: RoomState, maxRemeshes = MAX_REMESHES_PER_FRAME, timeBudgetMs = 0): number {
     this.frameCounter++;
     this.dirtySortBuf.length = 0;
@@ -610,9 +595,6 @@ export class Scene3D {
     return Math.max(0, this.dirtySortBuf.length - attempted);
   }
 
-  /**
-   * Rebuilds damage decals from dirtyDecals flags, capped at 512 nearest to focusPos (§4.4).
-   */
   public processDirtyDecals(room: RoomState): void {
     let anyDirty = false;
     const plane = CHUNKS_X * CHUNKS_Z;
@@ -671,7 +653,6 @@ export class Scene3D {
 
     if (all.length > MAX_DAMAGE_DECALS) {
       all.sort((a, b) => a.dSq - b.dSq);
-      // Re-mark retired chunks so their decals rebuild when approached (§4.4)
       for (let i = MAX_DAMAGE_DECALS; i < all.length; i++) {
         room.dirtyDecals[all[i].c] = 1;
       }
@@ -728,6 +709,33 @@ export class Scene3D {
       this.hoverNormalLine.visible = false;
     }
     return hit;
+  }
+
+  public computeTorsoAimDirection(
+    playerX: number,
+    playerY: number,
+    playerZ: number,
+    clientX: number,
+    clientY: number,
+  ): [number, number, number] {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.mouseNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouseNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouseNdc, this.camera);
+
+    const torsoY = playerY + 0.8;
+    this.aimPlane.constant = -torsoY;
+    const hit = this.raycaster.ray.intersectPlane(this.aimPlane, this.aimHit);
+    if (!hit) return [0, 0, 1];
+
+    const dx = this.aimHit.x - playerX;
+    const dz = this.aimHit.z - playerZ;
+    const len = Math.sqrt(dx * dx + dz * dz);
+    if (len < 1e-4) return [0, 0, 1];
+
+    const qx = Math.round((dx / len) * 1024) / 1024;
+    const qz = Math.round((dz / len) * 1024) / 1024;
+    return [qx, 0, qz];
   }
 
   public describeHit(hit: VoxelRayHit | null): string {

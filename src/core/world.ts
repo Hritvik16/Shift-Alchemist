@@ -84,14 +84,42 @@ export interface GravityPulseState {
   ownPulseGraceTicks: number;
 }
 
+export interface SuitActionState {
+  nozzleTapBurstShotsLeft: number;
+  nozzleTapSpacingTicks: number;
+  nozzleTapWaitTicks: number;
+  nozzleTapCdTicks: number;
+  nozzleHoseActive: boolean;
+  prevPrimaryHeld: boolean;
+  dashCdTicks: number;
+  dashDirX: number;
+  dashDirY: number;
+  dashDirZ: number;
+  aimDirX: number;
+  aimDirY: number;
+  aimDirZ: number;
+  siphonActive: boolean;
+  siphonMat: MaterialId;
+  siphonTargetX: number;
+  siphonTargetY: number;
+  siphonTargetZ: number;
+  siphonLitersThisTick: number;
+}
+
 export interface InputFrame {
-  moveX: number; // -1..+1 screen-aligned or world-aligned input (normalized in stage 1)
+  moveX: number;
   moveZ: number;
   ascend: boolean; // E in 0G
   descend: boolean; // Left-Shift in 0G
   pressQ: boolean; // Edge-triggered
   pressC: boolean; // Edge-triggered
   pressV: boolean; // Edge-triggered
+  aimX: number; // Normalized & quantized to 1/1024
+  aimY: number;
+  aimZ: number;
+  primaryHeld: boolean; // Left-Click
+  siphonHeld: boolean; // Right-Click
+  pressDash: boolean; // Space (edge-triggered)
 }
 
 export interface ImpactTelemetry {
@@ -104,12 +132,16 @@ export interface ImpactTelemetry {
 export interface WorldState {
   runSeed: number;
   simTick: number;
+  tankCapRank: number;
+  siphonRank: number;
+  nozzlePressureRank: number;
   gravCdRank: number;
   has3GOverdrive: boolean;
   scrap: number;
   player: Entity;
   playerTank: PlayerTankState;
   gravityPulse: GravityPulseState;
+  suit: SuitActionState;
   impactTelemetry: ImpactTelemetry;
   zeroGLoftTicksLeft: number;
   zeroGLoftDirY: -1 | 1;
@@ -127,6 +159,12 @@ export function createEmptyInput(): InputFrame {
     pressQ: false,
     pressC: false,
     pressV: false,
+    aimX: 0,
+    aimY: 0,
+    aimZ: 1,
+    primaryHeld: false,
+    siphonHeld: false,
+    pressDash: false,
   };
 }
 
@@ -191,11 +229,38 @@ export function createStarterTank(tankCapRank = 0): PlayerTankState {
   };
 }
 
+export function createSuitActionState(): SuitActionState {
+  return {
+    nozzleTapBurstShotsLeft: 0,
+    nozzleTapSpacingTicks: 0,
+    nozzleTapWaitTicks: 0,
+    nozzleTapCdTicks: 0,
+    nozzleHoseActive: false,
+    prevPrimaryHeld: false,
+    dashCdTicks: 0,
+    dashDirX: 0,
+    dashDirY: 0,
+    dashDirZ: 1,
+    aimDirX: 0,
+    aimDirY: 0,
+    aimDirZ: 1,
+    siphonActive: false,
+    siphonMat: MAT.AIR,
+    siphonTargetX: 0,
+    siphonTargetY: 0,
+    siphonTargetZ: 0,
+    siphonLitersThisTick: 0,
+  };
+}
+
 export function createWorldState(runSeed: number): WorldState {
   const seed = runSeed >>> 0;
   return {
     runSeed: seed,
     simTick: 0,
+    tankCapRank: 0,
+    siphonRank: 0,
+    nozzlePressureRank: 0,
     gravCdRank: 0,
     has3GOverdrive: false,
     scrap: 0,
@@ -208,6 +273,7 @@ export function createWorldState(runSeed: number): WorldState {
       ownPulseExempt: false,
       ownPulseGraceTicks: 0,
     },
+    suit: createSuitActionState(),
     impactTelemetry: {
       lastImpactSpeed: 0,
       lastWallSplatDmg: 0,
@@ -217,9 +283,34 @@ export function createWorldState(runSeed: number): WorldState {
     zeroGLoftTicksLeft: 0,
     zeroGLoftDirY: 1,
     gravityChangedThisTick: false,
-    entryLedgers: { water: 0, oil: 0, cryo: 0, acid: 0, oilCombusted: 0, cryoBoiledOff: 0, acidConsumed: 0 },
+    entryLedgers: {
+      water: 0,
+      oil: 0,
+      cryo: 0,
+      acid: 0,
+      oilCombusted: 0,
+      cryoBoiledOff: 0,
+      acidConsumed: 0,
+    },
     room: createEmptyRoomState(seed),
   };
+}
+
+export function getActiveChamber(tank: PlayerTankState): TankChamberState {
+  return tank.baffled ? tank.chambers[tank.activeChamber] : tank.chambers[0];
+}
+
+export function setTankCapRank(world: WorldState, rank: number): void {
+  const clamped = Math.max(0, Math.min(3, rank | 0));
+  world.tankCapRank = clamped;
+  if (world.playerTank.baffled) {
+    const cap = tankBaffledChamberCapL(clamped);
+    world.playerTank.chambers[0].capL = cap;
+    world.playerTank.chambers[1].capL = cap;
+  } else {
+    world.playerTank.chambers[0].capL = tankStarterCapL(clamped);
+    world.playerTank.chambers[1].capL = tankBaffledChamberCapL(clamped);
+  }
 }
 
 export function getFeetY(e: Entity): number {
@@ -258,7 +349,6 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
   const gp = world.gravityPulse;
   const cdTicks = Math.round(gravCooldownS(world.gravCdRank) * 60);
 
-  // 1. Tick active timed pulse or cooldown
   if (gp.activePulse !== 'none') {
     gp.pulseTicksLeft--;
     if (gp.pulseTicksLeft <= 0) {
@@ -266,9 +356,9 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
       gp.pulseTicksLeft = 0;
       world.room.gravityMode = GRAVITY_MODE.G1;
       world.player.upSign = 1;
-      gp.cooldownTicks = cdTicks; // Cooldown starts when C/V ends
+      gp.cooldownTicks = cdTicks;
       gp.ownPulseExempt = true;
-      gp.ownPulseGraceTicks = 60; // 1.0 s grace or until ground touch
+      gp.ownPulseGraceTicks = 60;
     }
   } else if (gp.cooldownTicks > 0) {
     gp.cooldownTicks--;
@@ -283,10 +373,8 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
     }
   }
 
-  // 2. Process Q / C / V edges deterministically
   if (input.pressQ) {
     if (gp.activePulse !== 'none') {
-      // Early cancel of active C/V back to 1G; starts GRAV_CD now; does NOT also toggle 0G
       gp.activePulse = 'none';
       gp.pulseTicksLeft = 0;
       world.room.gravityMode = GRAVITY_MODE.G1;
@@ -308,7 +396,6 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
       gp.ownPulseGraceTicks = 60;
     }
   } else if (input.pressC) {
-    // Baseline 2G Crush (3G with Overdrive); mutually blocked while C/V active
     if (gp.activePulse === 'none' && gp.cooldownTicks === 0) {
       gp.activePulse = 'crush';
       gp.pulseTicksLeft = Math.round(GRAV_CRUSH_S * 60);
@@ -318,7 +405,6 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
       gp.ownPulseGraceTicks = 0;
     }
   } else if (input.pressV) {
-    // Baseline -1G Inversion; mutually blocked while C/V active
     if (gp.activePulse === 'none' && gp.cooldownTicks === 0) {
       gp.activePulse = 'invert';
       gp.pulseTicksLeft = Math.round(GRAV_INVERT_S * 60);

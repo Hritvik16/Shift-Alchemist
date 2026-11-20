@@ -1,5 +1,50 @@
-import { GRAV_CRUSH_S, GRAV_INVERT_S, GRAVITY_MODE, gravCooldownS } from '../core/balance.ts';
-import type { WorldState } from '../core/world.ts';
+import {
+  DASH_CD_TICKS,
+  GRAV_CRUSH_S,
+  GRAV_INVERT_S,
+  GRAVITY_MODE,
+  MAT,
+  MATERIAL_SPEC,
+  byteToTempC,
+  gravCooldownS,
+} from '../core/balance.ts';
+import { getEffectiveMassKg, type TankChamberState, type WorldState } from '../core/world.ts';
+
+function formatHexCss(hex: number): string {
+  return `#${hex.toString(16).padStart(6, '0')}`;
+}
+
+function renderChamberBlock(
+  label: string,
+  chamber: TankChamberState,
+  isActive: boolean,
+  showActiveTag: boolean,
+): string {
+  const pct = Math.max(0, Math.min(100, (chamber.liters / Math.max(1, chamber.capL)) * 100));
+  const empty = chamber.liters <= 0 || chamber.mat === MAT.AIR;
+  const spec = MATERIAL_SPEC[chamber.mat];
+  const matName = empty ? 'EMPTY' : spec.name;
+  const barCol = empty ? '#3a4659' : formatHexCss(spec.colorHex);
+  const tempStr = empty ? '' : ` ${byteToTempC(chamber.tempByte)}°C`;
+  const chargeStr = !empty && chamber.chargeUnits > 0 ? ` +${chamber.chargeUnits * 2}V` : '';
+  const activeBadge =
+    showActiveTag && isActive
+      ? ' <span style="color:#5ef2d6;font-size:10px">[ACTIVE]</span>'
+      : '';
+
+  return (
+    `<div style="margin-bottom:6px">` +
+    `<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">` +
+    `<span>${label}${activeBadge} <strong style="color:${empty ? '#889bb5' : barCol}">${matName}</strong>${tempStr}` +
+    `${chargeStr ? `<strong style="color:#7ef9ff">${chargeStr}</strong>` : ''}</span>` +
+    `<span>${chamber.liters}/${chamber.capL} L</span>` +
+    `</div>` +
+    `<div style="height:6px;background:#1c2433;border-radius:3px;overflow:hidden">` +
+    `<div style="height:100%;width:${pct.toFixed(1)}%;background:${barCol}"></div>` +
+    `</div>` +
+    `</div>`
+  );
+}
 
 export class SuitHud {
   private readonly el: HTMLDivElement;
@@ -11,15 +56,15 @@ export class SuitHud {
       'bottom:14px',
       'left:14px',
       'z-index:15',
-      'background:rgba(10,14,22,0.82)',
+      'background:rgba(10,14,22,0.84)',
       'border:1px solid rgba(94,242,214,0.35)',
       'border-radius:6px',
       'padding:10px 14px',
       'color:#dcecf8',
       'font-size:12px',
-      'line-height:1.5',
+      'line-height:1.45',
       'pointer-events:none',
-      'min-width:235px',
+      'min-width:265px',
     ].join(';');
     parent.appendChild(this.el);
   }
@@ -52,7 +97,29 @@ export class SuitHud {
       barColor = '#6c7a91';
     }
 
-    const chamberA = world.playerTank.chambers[0];
+    const dashPct =
+      p.dashTimer > 0
+        ? 100
+        : world.suit.dashCdTicks > 0
+          ? Math.max(0, Math.min(100, ((DASH_CD_TICKS - world.suit.dashCdTicks) / DASH_CD_TICKS) * 100))
+          : 100;
+    const dashLabel =
+      p.dashTimer > 0
+        ? 'BOOST'
+        : world.suit.dashCdTicks > 0
+          ? `${(world.suit.dashCdTicks / 60).toFixed(1)}s`
+          : 'READY';
+    const dashCol = p.dashTimer > 0 ? '#ffd166' : world.suit.dashCdTicks > 0 ? '#6c7a91' : '#3be8b0';
+
+    const tank = world.playerTank;
+    const tankHtml =
+      renderChamberBlock('TANK A', tank.chambers[0], tank.activeChamber === 0, tank.baffled) +
+      (tank.baffled
+        ? renderChamberBlock('TANK B', tank.chambers[1], tank.activeChamber === 1, true)
+        : '');
+
+    const massKg = getEffectiveMassKg(p, tank);
+
     this.el.innerHTML =
       `<div style="display:flex;justify-content:space-between;margin-bottom:3px">` +
       `<span>SUIT HP</span><strong style="color:${hpDisplay <= 30 ? '#ff6b6b' : '#5ef2d6'}">${hpDisplay} / ${p.maxHp}</strong>` +
@@ -60,15 +127,22 @@ export class SuitHud {
       `<div style="height:6px;background:#1c2433;border-radius:3px;overflow:hidden;margin-bottom:8px">` +
       `<div style="height:100%;width:${hpPct.toFixed(1)}%;background:${hpDisplay <= 30 ? '#ff6b6b' : '#3be8b0'}"></div>` +
       `</div>` +
-      `<div style="display:flex;justify-content:space-between;margin-bottom:3px">` +
+      tankHtml +
+      `<div style="display:flex;justify-content:space-between;margin-bottom:3px;margin-top:4px">` +
       `<span>GRAVITY <strong style="color:${modeColor}">${mode}</strong></span>` +
       `<span style="color:#9db2cc">${barLabel}</span>` +
       `</div>` +
-      `<div style="height:6px;background:#1c2433;border-radius:3px;overflow:hidden;margin-bottom:8px">` +
+      `<div style="height:6px;background:#1c2433;border-radius:3px;overflow:hidden;margin-bottom:6px">` +
       `<div style="height:100%;width:${barPct.toFixed(1)}%;background:${barColor}"></div>` +
       `</div>` +
+      `<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">` +
+      `<span>JETPACK DASH</span><span style="color:${dashCol}">${dashLabel}</span>` +
+      `</div>` +
+      `<div style="height:5px;background:#1c2433;border-radius:3px;overflow:hidden;margin-bottom:7px">` +
+      `<div style="height:100%;width:${dashPct.toFixed(1)}%;background:${dashCol}"></div>` +
+      `</div>` +
       `<div style="display:flex;justify-content:space-between;color:#9db2cc;font-size:11px">` +
-      `<span>TANK A: ${chamberA.liters}/${chamberA.capL} L</span>` +
+      `<span>MASS: ${massKg.toFixed(0)} kg</span>` +
       `<span>SCRAP: ${world.scrap}</span>` +
       `</div>`;
   }

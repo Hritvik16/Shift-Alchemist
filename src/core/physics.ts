@@ -1,4 +1,5 @@
 import {
+  DASH_GRACE_TICKS,
   FIXED_DT,
   GRAVITY_ACCEL_BY_MODE,
   GRAVITY_MODE,
@@ -35,6 +36,7 @@ import {
   stepFluidStage8,
   stepMinimalCryoWarming,
 } from './fluids.ts';
+import { applyDashVelocityIfActive, stepSuitActionsStage1 } from './suit.ts';
 import {
   getEffectiveMassKg,
   getFeetY,
@@ -169,7 +171,6 @@ function applyWallImpactToSolidFace(
   minVZ: number,
   maxVZ: number,
 ): void {
-  // Stage 2: Tier 1 (ICE/GLASS_VAT) = 4, Tier 2 (WOOD_BARRIER) = 6, Tier 3 = 0; 3x if embrittled
   for (let vy = minVY; vy <= maxVY; vy++) {
     for (let vz = minVZ; vz <= maxVZ; vz++) {
       for (let vx = minVX; vx <= maxVX; vx++) {
@@ -221,7 +222,6 @@ function resolveSolidImpact(
 
   if (entity.impulseTimer <= 0) return;
 
-  // Qualifying impact damages brittle/wood solids even if player has i-frames
   applyWallImpactToSolidFace(
     world.room,
     bounds.minVX,
@@ -245,10 +245,6 @@ function resolveSolidImpact(
   }
 }
 
-/**
- * Integrates one entity through swept axis-by-axis AABB-vs-voxel collision
- * with 0.1/0.2 m stair step-up (both +1 and -1 upSign) and Wall-Splat checks.
- */
 export function integrateEntityVoxelPhysics(
   world: WorldState,
   entity: Entity,
@@ -256,19 +252,16 @@ export function integrateEntityVoxelPhysics(
   const room = world.room;
   const mode = room.gravityMode;
   const gAccel = GRAVITY_ACCEL_BY_MODE[mode];
+  const wasDashing = entity.dashTimer > 0;
 
-  // Decrement kinematics timers
   if (entity.impactIFrames > 0) entity.impactIFrames--;
   if (entity.impulseTimer > 0) entity.impulseTimer--;
-  if (entity.dashTimer > 0) entity.dashTimer--;
-  if (entity.dashGraceTimer > 0) entity.dashGraceTimer--;
 
-  // Apply gravity acceleration
-  if (mode !== GRAVITY_MODE.G0) {
+  // Apply gravity acceleration (suspended during active Jetpack Dash so horizontal dashes cross gaps cleanly)
+  if (mode !== GRAVITY_MODE.G0 && !wasDashing) {
     entity.vy += gAccel * FIXED_DT;
   }
 
-  // Flag impulseTimer for high-speed falls (> 7.5 m/s), honoring player own-pulse exemption (§8.2)
   const isPlayerExempt = entity.kind === 'player' && world.gravityPulse.ownPulseExempt;
   if (Math.abs(entity.vy) > WALL_SPLAT_V_MIN && !isPlayerExempt) {
     entity.impulseTimer = IMPULSE_TIMER_TICKS;
@@ -392,6 +385,16 @@ export function integrateEntityVoxelPhysics(
     }
   }
 
+  // Tick dash duration -> start 0.15 s post-dash wall-splat grace when dash ends (§8.1)
+  if (wasDashing) {
+    entity.dashTimer--;
+    if (entity.dashTimer === 0) {
+      entity.dashGraceTimer = DASH_GRACE_TICKS;
+    }
+  } else if (entity.dashGraceTimer > 0) {
+    entity.dashGraceTimer--;
+  }
+
   // Ground probe in supporting direction (-upSign) when not in 0G
   if (mode === GRAVITY_MODE.G0) {
     entity.grounded = false;
@@ -415,7 +418,6 @@ export function integrateEntityVoxelPhysics(
     }
   }
 
-  // Clear player own-pulse exemption once the player lands on ground after pulse ends
   if (
     entity.kind === 'player' &&
     entity.grounded &&
@@ -427,75 +429,71 @@ export function integrateEntityVoxelPhysics(
   }
 }
 
-/**
- * Applies player WASD + 0G E/Shift thruster controls and steps Stages 1-2 for one 60 Hz tick.
- */
 export function stepWorldTick(world: WorldState, input: InputFrame): void {
   world.simTick++;
 
-  // Stage 1: Input & Suit Gravity State Machine
+  // Stage 1: Gravity pulse state machine + atomic Siphon, charge decay, Nozzle, Jetpack Dash
   stepSuitGravityState(world, input);
+  stepSuitActionsStage1(world, input);
 
   const player = world.player;
   const mode = world.room.gravityMode;
-  const speed = getPlayerMoveSpeed(mode);
 
-  // Normalize horizontal movement input (pure sqrt, deterministic)
-  let ix = input.moveX;
-  let iz = input.moveZ;
-  const ilen = Math.sqrt(ix * ix + iz * iz);
-  if (ilen > 1e-6) {
-    ix /= ilen;
-    iz /= ilen;
-  } else {
-    ix = 0;
-    iz = 0;
-  }
-
-  if (mode === GRAVITY_MODE.G0) {
-    // 0G horizontal + vertical thrusters with smooth zero-gravity damping
-    const accel = 18.0 * FIXED_DT;
-    const targetVx = ix * speed;
-    const targetVz = iz * speed;
-    player.vx += Math.max(-accel, Math.min(accel, targetVx - player.vx));
-    player.vz += Math.max(-accel, Math.min(accel, targetVz - player.vz));
-
-    let vertDir = 0;
-    if (input.ascend) vertDir += 1;
-    if (input.descend) vertDir -= 1;
-    let targetVy = vertDir * PLAYER_SPEED_0G_VERT;
-
-    // 0.1 m soft thruster cushion near floor/ceiling (§8.1)
-    if (targetVy !== 0) {
-      const probeDist = 0.12;
-      const probeY = targetVy > 0 ? player.y + probeDist : player.y - probeDist;
-      if (
-        aabbOverlapsSolid(
-          world.room,
-          player.x,
-          probeY,
-          player.z,
-          player.halfW,
-          player.height,
-          player.halfD,
-        )
-      ) {
-        targetVy *= 0.25;
-      }
+  if (!applyDashVelocityIfActive(world)) {
+    const speed = getPlayerMoveSpeed(mode);
+    let ix = input.moveX;
+    let iz = input.moveZ;
+    const ilen = Math.sqrt(ix * ix + iz * iz);
+    if (ilen > 1e-6) {
+      ix /= ilen;
+      iz /= ilen;
+    } else {
+      ix = 0;
+      iz = 0;
     }
-    const vAccel = 16.0 * FIXED_DT;
-    player.vy += Math.max(-vAccel, Math.min(vAccel, targetVy - player.vy));
-  } else {
-    // Ground / air steering in 1G/2G/3G/-1G (exo-suit servos hold constant run speed)
-    const blend = player.grounded ? 0.45 : 0.18;
-    player.vx += (ix * speed - player.vx) * blend;
-    player.vz += (iz * speed - player.vz) * blend;
+
+    if (mode === GRAVITY_MODE.G0) {
+      const accel = 18.0 * FIXED_DT;
+      const targetVx = ix * speed;
+      const targetVz = iz * speed;
+      player.vx += Math.max(-accel, Math.min(accel, targetVx - player.vx));
+      player.vz += Math.max(-accel, Math.min(accel, targetVz - player.vz));
+
+      let vertDir = 0;
+      if (input.ascend) vertDir += 1;
+      if (input.descend) vertDir -= 1;
+      let targetVy = vertDir * PLAYER_SPEED_0G_VERT;
+
+      if (targetVy !== 0) {
+        const probeDist = 0.12;
+        const probeY = targetVy > 0 ? player.y + probeDist : player.y - probeDist;
+        if (
+          aabbOverlapsSolid(
+            world.room,
+            player.x,
+            probeY,
+            player.z,
+            player.halfW,
+            player.height,
+            player.halfD,
+          )
+        ) {
+          targetVy *= 0.25;
+        }
+      }
+      const vAccel = 16.0 * FIXED_DT;
+      player.vy += Math.max(-vAccel, Math.min(vAccel, targetVy - player.vy));
+    } else {
+      const blend = player.grounded ? 0.45 : 0.18;
+      player.vx += (ix * speed - player.vx) * blend;
+      player.vz += (iz * speed - player.vz) * blend;
+    }
   }
 
   // Stage 2: Entity Kinematics & Swept AABB Voxel Collisions
   integrateEntityVoxelPhysics(world, player);
 
-  // Process vat shatters & 1G->0G lift before ballistic integration
+  // Process vat shatters & gravity-shift reseed
   processPendingVatShatters(world);
   if (world.gravityChangedThisTick) {
     reseedActiveLists(world.room, world.simTick);
@@ -515,10 +513,6 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
   stepFluidStage8(world);
 }
 
-/**
- * Deck-relative Laser Plumb-Line cast from feetY along plumbDir (§5).
- * Visible only when distance > 0.2 m to the first solid voxel hit.
- */
 export function computePlumbLine(room: RoomState, entity: Entity): PlumbLineResult {
   const plumbDir = getPlumbDir(room.gravityMode);
   const feetY = getFeetY(entity);

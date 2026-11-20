@@ -948,7 +948,12 @@ export function recountChunkFluids(room: RoomState): void {
   }
 }
 
-export function recomputeRoomLedgers(room: RoomState): void {
+export interface TankLedgerView {
+  readonly baffled: boolean;
+  readonly chambers: readonly { readonly mat: MaterialId; readonly liters: number }[];
+}
+
+export function recomputeRoomLedgers(room: RoomState, playerTank?: TankLedgerView): void {
   let water = 0;
   let oil = 0;
   let cryo = 0;
@@ -988,6 +993,17 @@ export function recomputeRoomLedgers(room: RoomState): void {
     else if (mat === MAT.OIL) oil++;
     else if (mat === MAT.CRYO) cryo++;
     else if (mat === MAT.ACID) acid++;
+  }
+
+  if (playerTank) {
+    const chamberCount = playerTank.baffled ? 2 : 1;
+    for (let i = 0; i < chamberCount; i++) {
+      const c = playerTank.chambers[i];
+      if (!c || c.liters <= 0) continue;
+      if (c.mat === MAT.WATER) water += c.liters;
+      else if (c.mat === MAT.OIL) oil += c.liters;
+      else if (c.mat === MAT.CRYO) cryo += c.liters;
+    }
   }
 
   room.ledgers.water = water;

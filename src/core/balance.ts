@@ -113,6 +113,7 @@ export const TALL_CEILING_UNDERSIDE_Y = 62; // 6.2 m
 export const PLAYER_AABB_W = 0.6;
 export const PLAYER_AABB_H = 1.6;
 export const PLAYER_AABB_D = 0.6;
+export const PLAYER_TORSO_OFFSET_M = 0.8;
 export const PLAYER_DRY_MASS_KG = 90;
 export const PLAYER_MAX_HP = 100;
 export const PLAYER_PATCH_HEAL = 25;
@@ -149,11 +150,21 @@ export function computeBaffledAutoSplit(
 
 export const NOZZLE_TAP_BURST_L = 15;
 export const NOZZLE_TAP_SHOT_L = 5;
+export const NOZZLE_TAP_SHOTS = 3;
 export const NOZZLE_TAP_SPACING_TICKS = 4;
 export const NOZZLE_TAP_CD_S = 0.3;
+export const NOZZLE_TAP_CD_TICKS = 18; // 0.30 s @ 60 Hz
+export const NOZZLE_TAP_WAIT_TICKS = 15; // 0.25 s pool-full wait before canceling unused shots
 export const NOZZLE_TAP_SPEED_M_S = 18.0;
+export const NOZZLE_TAP_RECOIL_0G = 0.7;
+export const NOZZLE_CLUSTER_RADIUS_M = 0.15;
 export const NOZZLE_HOLD_RATE_LPS = 60;
 export const NOZZLE_HOLD_SPEED_M_S = 15.0;
+export const NOZZLE_HOLD_RECOIL_0G = 0.08;
+
+export function nozzlePressureMult(rank: number): number {
+  return 1.0 + 0.2 * rank;
+}
 
 export const AIR_BURST_RANGE_M = 8.0;
 export const AIR_BURST_CD_S = 0.25;
@@ -174,12 +185,16 @@ export function siphonRateLPerTick(rank: number): number {
 
 export const SIPHON_RANGE_M = 6.0;
 export const SIPHON_CONE_DEG = 35;
+export const SIPHON_CONE_COS = 0.8191520442889918; // cos(35 deg), deterministic constant
+export const SIPHON_CONE_COS_SQ = SIPHON_CONE_COS * SIPHON_CONE_COS;
 
 export const DASH_SPEED_M_S = 14.0;
 export const DASH_EXHAUST_L = 24;
+export const DASH_EXHAUST_SPEED_M_S = 0.5;
 export const DASH_CD_S = 1.2;
-export const DASH_DURATION_TICKS = 24;
-export const DASH_GRACE_TICKS = 9; // 0.15 s
+export const DASH_CD_TICKS = 72; // 1.2 s @ 60 Hz
+export const DASH_DURATION_TICKS = 24; // 0.4 s @ 60 Hz
+export const DASH_GRACE_TICKS = 9; // 0.15 s @ 60 Hz
 
 export const GRAV_CD_BASE_S = 4.0;
 export const GRAV_CD_STEP_S = 0.5;
@@ -310,7 +325,7 @@ export interface MaterialSpec {
   readonly densityKgPerL: number;
   readonly viscositySteps: number;
   readonly elecCond: number;
-  readonly structHp: number; // 0 for non-solids, 4/12/15/Infinity for solids
+  readonly structHp: number;
   readonly structTier: 0 | 1 | 2 | 3;
   readonly colorHex: number;
 }

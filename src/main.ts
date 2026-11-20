@@ -1,10 +1,13 @@
 import {
   FIXED_DT,
+  MAT,
+  MATERIAL_SPEC,
   MAX_FLUID_CACHE_REBUILDS_FALLBACK,
   MAX_FLUID_CACHE_REBUILDS_PER_FRAME,
   MAX_FRAME_DT,
   MAX_REMESHES_FALLBACK,
   MAX_REMESHES_PER_FRAME,
+  byteToTempC,
 } from './core/balance.ts';
 import { computePlumbLine, stepWorldTick } from './core/physics.ts';
 import { generateCargoHold } from './core/roomGen.ts';
@@ -14,7 +17,12 @@ import {
   recomputeRoomLedgers,
   type VoxelRayHit,
 } from './core/types.ts';
-import { createWorldState, type InputFrame } from './core/world.ts';
+import {
+  createWorldState,
+  getActiveChamber,
+  getEffectiveMassKg,
+  type InputFrame,
+} from './core/world.ts';
 import { DebugOverlay } from './viewer/debugOverlay.ts';
 import { FluidRenderer } from './viewer/fluidRenderer.ts';
 import { SuitHud } from './viewer/hud.ts';
@@ -29,6 +37,7 @@ const runSeed = urlSeed ? Number(urlSeed) >>> 0 : Date.now() >>> 0;
 
 const world = createWorldState(runSeed);
 generateCargoHold(world.room, runSeed);
+recomputeRoomLedgers(world.room, world.playerTank);
 world.entryLedgers = { ...world.room.ledgers };
 
 const scene3D = new Scene3D(app);
@@ -51,6 +60,9 @@ const keys = new Set<string>();
 let queuedQ = false;
 let queuedC = false;
 let queuedV = false;
+let queuedDash = false;
+let primaryHeld = false;
+let siphonHeld = false;
 let pointerX = window.innerWidth * 0.5;
 let pointerY = window.innerHeight * 0.5;
 let lastHit: VoxelRayHit | null = null;
@@ -59,15 +71,29 @@ window.addEventListener('resize', () => {
   scene3D.resize(app.clientWidth, app.clientHeight);
 });
 
+window.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+});
+
 window.addEventListener('pointermove', (e) => {
   pointerX = e.clientX;
   pointerY = e.clientY;
 });
 
 window.addEventListener('pointerdown', (e) => {
-  if (e.button === 0 && overlay.visible && lastHit) {
+  if (e.button === 0) {
+    primaryHeld = true;
+  } else if (e.button === 2) {
+    siphonHeld = true;
+  } else if (e.button === 1 && overlay.visible && lastHit) {
+    e.preventDefault();
     applyStructuralDamage(world.room, lastHit.x, lastHit.y, lastHit.z, 2, false, world.simTick);
   }
+});
+
+window.addEventListener('pointerup', (e) => {
+  if (e.button === 0) primaryHeld = false;
+  else if (e.button === 2) siphonHeld = false;
 });
 
 window.addEventListener(
@@ -90,6 +116,7 @@ window.addEventListener('keydown', (e) => {
     if (e.code === 'KeyQ') queuedQ = true;
     else if (e.code === 'KeyC') queuedC = true;
     else if (e.code === 'KeyV') queuedV = true;
+    else if (e.code === 'Space') queuedDash = true;
   }
   keys.add(e.code);
 
@@ -104,6 +131,8 @@ window.addEventListener('keyup', (e) => {
 
 window.addEventListener('blur', () => {
   keys.clear();
+  primaryHeld = false;
+  siphonHeld = false;
 });
 
 function sampleInput(): InputFrame {
@@ -125,6 +154,13 @@ function sampleInput(): InputFrame {
     moveX += 1;
     moveZ -= 1;
   }
+  const [aimX, aimY, aimZ] = scene3D.computeTorsoAimDirection(
+    world.player.x,
+    world.player.y,
+    world.player.z,
+    pointerX,
+    pointerY,
+  );
   const frame: InputFrame = {
     moveX,
     moveZ,
@@ -133,10 +169,17 @@ function sampleInput(): InputFrame {
     pressQ: queuedQ,
     pressC: queuedC,
     pressV: queuedV,
+    aimX,
+    aimY,
+    aimZ,
+    primaryHeld,
+    siphonHeld,
+    pressDash: queuedDash,
   };
   queuedQ = false;
   queuedC = false;
   queuedV = false;
+  queuedDash = false;
   return frame;
 }
 
@@ -165,8 +208,6 @@ function tick(now: number): void {
   frameWrite = (frameWrite + 1) % frameWindow.length;
   if (frameFilled < frameWindow.length) frameFilled++;
 
-  // Adaptive fallback updated after measuring simMs + renderMs below
-
   accumulator += clampedDt;
   const simStart = performance.now();
   let ticksThisFrame = 0;
@@ -179,7 +220,15 @@ function tick(now: number): void {
 
   const renderStart = performance.now();
   const plumb = computePlumbLine(world.room, world.player);
-  playerRig.update(world.player, world.room.gravityMode, plumb, clampedDt);
+  playerRig.update(
+    world.player,
+    world.playerTank,
+    world.suit,
+    world.room.gravityMode,
+    plumb,
+    clampedDt,
+    now * 0.001,
+  );
 
   scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
   scene3D.updateCamera();
@@ -192,7 +241,13 @@ function tick(now: number): void {
 
   const dirtyQueue = scene3D.processDirtyMeshes(world.room, remeshCap, 0);
   scene3D.processDirtyDecals(world.room);
-  const dirtyFluidQueue = fluidRenderer.update(world.room, scene3D.focusPos, now * 0.001, fluidRebuildCap, 0);
+  const dirtyFluidQueue = fluidRenderer.update(
+    world.room,
+    scene3D.focusPos,
+    now * 0.001,
+    fluidRebuildCap,
+    0,
+  );
   scene3D.render();
   const renderMs = performance.now() - renderStart;
   const workMs = simMs + renderMs;
@@ -214,13 +269,19 @@ function tick(now: number): void {
   if (overlay.visible) {
     ledgerCheckCounter++;
     if (ledgerCheckCounter % 15 === 0) {
-      recomputeRoomLedgers(world.room);
+      recomputeRoomLedgers(world.room, world.playerTank);
     }
 
     const slice = frameWindow.slice(0, frameFilled).sort();
     let sum = 0;
     for (let i = 0; i < slice.length; i++) sum += slice[i];
     const avgMs = sum / Math.max(1, slice.length);
+
+    const ch = getActiveChamber(world.playerTank);
+    const tankSummary =
+      ch.liters > 0 && ch.mat !== MAT.AIR
+        ? `${MATERIAL_SPEC[ch.mat].name} ${ch.liters}/${ch.capL}L (${byteToTempC(ch.tempByte)}C)`
+        : `EMPTY 0/${ch.capL}L`;
 
     overlay.update({
       fps: 1000 / Math.max(0.001, avgMs),
@@ -246,6 +307,9 @@ function tick(now: number): void {
       playerY: world.player.y,
       playerZ: world.player.z,
       playerVy: world.player.vy,
+      playerMassKg: getEffectiveMassKg(world.player, world.playerTank),
+      tankSummary,
+      siphonActive: world.suit.siphonActive,
       upSign: world.player.upSign,
       grounded: world.player.grounded,
       gravityMode: world.room.gravityMode,

@@ -155,18 +155,18 @@ export const NOZZLE_TAP_SPACING_TICKS = 4;
 export const NOZZLE_TAP_CD_S = 0.3;
 export const NOZZLE_TAP_CD_TICKS = 18; // 0.30 s @ 60 Hz
 export const NOZZLE_TAP_WAIT_TICKS = 15; // 0.25 s pool-full wait before canceling unused shots
-export const NOZZLE_TAP_SPEED_M_S = 18.0;
+export const NOZZLE_TAP_SPEED_M_S = 10.0;
 export const NOZZLE_TAP_RECOIL_0G = 0.7;
 export const NOZZLE_CLUSTER_RADIUS_M = 0.15;
 export const NOZZLE_HOLD_RATE_LPS = 60;
-export const NOZZLE_HOLD_SPEED_M_S = 15.0;
+export const NOZZLE_HOLD_SPEED_M_S = 9.0;
 export const NOZZLE_HOLD_RECOIL_0G = 0.08;
 
 export function nozzlePressureMult(rank: number): number {
   return 1.0 + 0.2 * rank;
 }
 
-export const AIR_BURST_RANGE_M = 8.0;
+export const AIR_BURST_RANGE_M = 4.0;
 export const AIR_BURST_CD_S = 0.25;
 export const AIR_BURST_IMPULSE_NOM = 960;
 export const AIR_BURST_CONE_DEG = 25;
@@ -224,7 +224,8 @@ export function gravCooldownS(rank: number): number {
   return Math.max(GRAV_CD_MIN, GRAV_CD_BASE_S - GRAV_CD_STEP_S * rank);
 }
 
-export const LOCKON_RANGE_M = 12.0;
+export const LOCKON_RANGE_M = 7.5;
+export const LOCKON_CURSOR_SNAP_M = 0.8;
 
 // Combat, Vats & 0G Loft
 export const WALL_SPLAT_BASE_CAP = 120;

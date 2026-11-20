@@ -1,5 +1,6 @@
 import {
   FIXED_DT,
+  GRAVITY_ACCEL_BY_MODE,
   MAT,
   MATERIAL_SPEC,
   MAX_FLUID_CACHE_REBUILDS_FALLBACK,
@@ -7,13 +8,20 @@ import {
   MAX_FRAME_DT,
   MAX_REMESHES_FALLBACK,
   MAX_REMESHES_PER_FRAME,
+  NOZZLE_HOLD_SPEED_M_S,
+  NOZZLE_TAP_SPEED_M_S,
+  PLAYER_TORSO_OFFSET_M,
+  VOXEL_SIZE_M,
+  nozzlePressureMult,
   byteToTempC,
 } from './core/balance.ts';
+import { computeBallisticAimDir } from './core/combat.ts';
 import { computePlumbLine, stepWorldTick } from './core/physics.ts';
 import { generateCargoHold, populateCargoHoldEntities } from './core/roomGen.ts';
 import {
   applyStructuralDamage,
   carveSphereDebug,
+  isSolidMat,
   recomputeRoomLedgers,
   type VoxelRayHit,
 } from './core/types.ts';
@@ -180,7 +188,7 @@ window.addEventListener('blur', () => {
   siphonHeld = false;
 });
 
-function sampleInput(): InputFrame {
+function sampleInput(hoverHit: VoxelRayHit | null): InputFrame {
   let moveX = 0;
   let moveZ = 0;
   if (keys.has('KeyW')) {
@@ -199,13 +207,52 @@ function sampleInput(): InputFrame {
     moveX += 1;
     moveZ -= 1;
   }
-  const aim = scene3D.computeTorsoAim(
+
+  let hasAimPoint = false;
+  let aimPointX = 0;
+  let aimPointY = 0;
+  let aimPointZ = 0;
+
+  if (hoverHit) {
+    hasAimPoint = true;
+    aimPointX = Math.round((hoverHit.x + 0.5) * VOXEL_SIZE_M * 1024) / 1024;
+    aimPointY =
+      Math.round((hoverHit.y + (isSolidMat(hoverHit.mat) ? 1.0 : 0.5)) * VOXEL_SIZE_M * 1024) / 1024;
+    aimPointZ = Math.round((hoverHit.z + 0.5) * VOXEL_SIZE_M * 1024) / 1024;
+  } else {
+    const planeAim = scene3D.computeTorsoAim(
+      world.player.x,
+      world.player.y,
+      world.player.z,
+      pointerX,
+      pointerY,
+    );
+    hasAimPoint = planeAim.hasAimPoint;
+    aimPointX = planeAim.aimPointX;
+    aimPointY = planeAim.aimPointY;
+    aimPointZ = planeAim.aimPointZ;
+  }
+
+  const ch = getActiveChamber(world.playerTank);
+  const loaded = ch.liters > 0 && ch.mat !== MAT.AIR;
+  const speed = loaded
+    ? (world.suit.nozzleHoseActive ? NOZZLE_HOLD_SPEED_M_S : NOZZLE_TAP_SPEED_M_S) *
+      nozzlePressureMult(world.nozzlePressureRank)
+    : 0;
+  const [rawAX, rawAY, rawAZ] = computeBallisticAimDir(
     world.player.x,
-    world.player.y,
+    world.player.y + PLAYER_TORSO_OFFSET_M,
     world.player.z,
-    pointerX,
-    pointerY,
+    aimPointX,
+    aimPointY,
+    aimPointZ,
+    speed,
+    GRAVITY_ACCEL_BY_MODE[world.room.gravityMode],
   );
+  const aimX = Math.round(rawAX * 1024) / 1024;
+  const aimY = Math.round(rawAY * 1024) / 1024;
+  const aimZ = Math.round(rawAZ * 1024) / 1024;
+
   const frame: InputFrame = {
     moveX,
     moveZ,
@@ -214,13 +261,13 @@ function sampleInput(): InputFrame {
     pressQ: queuedQ,
     pressC: queuedC,
     pressV: queuedV,
-    aimX: aim.aimX,
-    aimY: aim.aimY,
-    aimZ: aim.aimZ,
-    hasAimPoint: aim.hasAimPoint,
-    aimPointX: aim.aimPointX,
-    aimPointY: aim.aimPointY,
-    aimPointZ: aim.aimPointZ,
+    aimX,
+    aimY,
+    aimZ,
+    hasAimPoint,
+    aimPointX,
+    aimPointY,
+    aimPointZ,
     primaryHeld,
     siphonHeld,
     pressDash: queuedDash,
@@ -243,6 +290,7 @@ let slowFrameStreak = 0;
 let fastFrameStreak = 0;
 let adaptiveFallback = false;
 let ledgerCheckCounter = 0;
+let cameraShake = 0;
 
 function percentile(sorted: Float64Array, p: number): number {
   if (sorted.length === 0) return 0;
@@ -259,11 +307,12 @@ function tick(now: number): void {
   frameWrite = (frameWrite + 1) % frameWindow.length;
   if (frameFilled < frameWindow.length) frameFilled++;
 
+
   accumulator += clampedDt;
   const simStart = performance.now();
   let ticksThisFrame = 0;
   while (accumulator >= FIXED_DT && ticksThisFrame < 3) {
-    const inp = sampleInput();
+    const inp = sampleInput(lastHit);
     if (inp.pressInteract && world.runCleared) {
       startNewRun((world.runSeed + 1) >>> 0);
       accumulator = 0;
@@ -284,18 +333,33 @@ function tick(now: number): void {
   const timeSec = now * 0.001;
   const plumb = computePlumbLine(world.room, world.player);
   playerRig.update(
+    world.room,
     world.player,
     world.playerTank,
     world.suit,
     world.room.gravityMode,
     plumb,
+    world.nozzlePressureRank,
     clampedDt,
     timeSec,
   );
 
-  scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
+  for (let i = 0; i < world.room.recentExplosions.length; i++) {
+    const ev = world.room.recentExplosions[i];
+    const dist = Math.hypot(ev.x - world.player.x, ev.y - world.player.y, ev.z - world.player.z);
+    if (dist < 12.0) {
+      cameraShake = Math.min(0.22, cameraShake + 0.16 * (1 - dist / 12.0));
+    }
+  }
+  cameraShake *= Math.exp(-15.0 * clampedDt);
+  if (cameraShake < 0.002) cameraShake = 0;
+  const shakeX = cameraShake > 0 ? Math.sin(timeSec * 67.0) * cameraShake : 0;
+  const shakeY = cameraShake > 0 ? Math.cos(timeSec * 83.0) * cameraShake * 0.6 : 0;
+  const shakeZ = cameraShake > 0 ? Math.sin(timeSec * 73.0 + 1.3) * cameraShake : 0;
+
+  scene3D.focusPos.set(world.player.x + shakeX, world.player.y + shakeY, world.player.z + shakeZ);
   scene3D.updateCamera();
-  entityRenderer.update(world, scene3D.camera, timeSec);
+  entityRenderer.update(world, scene3D.camera, timeSec, clampedDt);
   lastHit = scene3D.pickVoxel(world.room, pointerX, pointerY);
 
   const remeshCap = adaptiveFallback ? MAX_REMESHES_FALLBACK : MAX_REMESHES_PER_FRAME;
@@ -365,6 +429,8 @@ function tick(now: number): void {
       meshMemMB: scene3D.getTotalMeshMemMB(),
       decalCount: scene3D.getDecalCount(),
       activeFluidCount: world.room.activeFluidCurCount,
+      activeThermalCount: world.room.activeThermalCurCount,
+      explosionQueueCount: world.room.explosionQueue.length,
       ballisticCount: world.room.ballistic.count,
       deferredCount: world.room.deferredFluid.count,
       renderedGridFluid: fluidRenderer.renderedGridCount,

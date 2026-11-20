@@ -1,12 +1,20 @@
 import * as THREE from 'three';
 import {
+  AIR_BURST_RANGE_M,
+  GRAVITY_ACCEL_BY_MODE,
   GRAVITY_MODE,
+  LOCKON_RANGE_M,
   MAT,
   MATERIAL_SPEC,
+  NOZZLE_HOLD_SPEED_M_S,
+  NOZZLE_TAP_SPEED_M_S,
   PLAYER_TORSO_OFFSET_M,
+  VOXEL_SIZE_M,
+  nozzlePressureMult,
   type GravityMode,
 } from '../core/balance.ts';
 import type { PlumbLineResult } from '../core/physics.ts';
+import { cellIndex, getMat, inRoomBounds, isSolidMat, type RoomState } from '../core/types.ts';
 import {
   getActiveChamber,
   type Entity,
@@ -15,6 +23,7 @@ import {
 } from '../core/world.ts';
 
 const RIBBON_SEGMENTS = 12;
+const AIM_ARC_POINTS = 28;
 
 export class PlayerRig {
   public readonly root = new THREE.Group();
@@ -31,6 +40,17 @@ export class PlayerRig {
   private readonly siphonMat: THREE.LineBasicMaterial;
   private readonly siphonRing: THREE.Mesh;
   private readonly siphonRingMat: THREE.MeshBasicMaterial;
+
+  // Diegetic Nozzle Aim Arc + Splash Landing Ring + 0G Altitude Drop-Line
+  private readonly aimArcLine: THREE.Line;
+  private readonly aimArcPositions: Float32Array;
+  private readonly aimArcMat: THREE.LineBasicMaterial;
+  private readonly aimLandingRing: THREE.Mesh;
+  private readonly aimLandingRingMat: THREE.MeshBasicMaterial;
+  private readonly aimDropLine: THREE.Line;
+  private readonly aimDropPositions: Float32Array;
+  private readonly aimDropMat: THREE.LineBasicMaterial;
+
   private currentFlipRad = 0;
 
   constructor(scene: THREE.Scene) {
@@ -103,7 +123,6 @@ export class PlayerRig {
     pauldrons.castShadow = true;
     this.body.add(pauldrons);
 
-    // Backpack fluid tank shell + diegetic liquid level column
     const tankShell = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.52, 12), tankShellMat);
     tankShell.position.set(0, 0.18, 0.22);
     this.body.add(tankShell);
@@ -127,34 +146,34 @@ export class PlayerRig {
     this.root.add(this.body);
     scene.add(this.root);
 
-    // Deck-relative Laser Plumb-Line + Surface Ring (3D Overlay Pass)
+    // Deck-relative Laser Plumb-Line + Surface Ring
     this.plumbPositions = new Float32Array(6);
     const lineGeo = new THREE.BufferGeometry();
     lineGeo.setAttribute('position', new THREE.BufferAttribute(this.plumbPositions, 3));
     this.plumbLineMat = new THREE.LineBasicMaterial({
       color: 0x38e8ff,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.9,
     });
     this.plumbLine = new THREE.Line(lineGeo, this.plumbLineMat);
     this.plumbLine.frustumCulled = false;
     this.plumbLine.visible = false;
     scene.add(this.plumbLine);
 
-    const ringGeo = new THREE.RingGeometry(0.22, 0.34, 24);
+    const ringGeo = new THREE.RingGeometry(0.24, 0.38, 24);
     ringGeo.rotateX(-Math.PI / 2);
     this.plumbRingMat = new THREE.MeshBasicMaterial({
       color: 0x38e8ff,
       side: THREE.DoubleSide,
       transparent: true,
-      opacity: 0.9,
+      opacity: 0.92,
       depthWrite: false,
     });
     this.plumbRing = new THREE.Mesh(ringGeo, this.plumbRingMat);
     this.plumbRing.visible = false;
     scene.add(this.plumbRing);
 
-    // Cosmetic Siphon Ribbon + Intake Ring (viewer-only, 0 sim impact, §6.2)
+    // Cosmetic Siphon Ribbon + Intake Ring
     this.siphonPositions = new Float32Array((RIBBON_SEGMENTS + 1) * 3);
     const ribbonGeo = new THREE.BufferGeometry();
     ribbonGeo.setAttribute('position', new THREE.BufferAttribute(this.siphonPositions, 3));
@@ -180,20 +199,200 @@ export class PlayerRig {
     this.siphonRing = new THREE.Mesh(sRingGeo, this.siphonRingMat);
     this.siphonRing.visible = false;
     scene.add(this.siphonRing);
+
+    // Nozzle Aim Arc + Splash Landing Ring + 0G Aim Drop-Line
+    this.aimArcPositions = new Float32Array(AIM_ARC_POINTS * 3);
+    const arcGeo = new THREE.BufferGeometry();
+    arcGeo.setAttribute('position', new THREE.BufferAttribute(this.aimArcPositions, 3));
+    this.aimArcMat = new THREE.LineBasicMaterial({
+      color: 0x7ef9ff,
+      transparent: true,
+      opacity: 0.62,
+    });
+    this.aimArcLine = new THREE.Line(arcGeo, this.aimArcMat);
+    this.aimArcLine.frustumCulled = false;
+    scene.add(this.aimArcLine);
+
+    const landRingGeo = new THREE.RingGeometry(0.14, 0.26, 20);
+    landRingGeo.rotateX(-Math.PI / 2);
+    this.aimLandingRingMat = new THREE.MeshBasicMaterial({
+      color: 0x7ef9ff,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.82,
+      depthWrite: false,
+    });
+    this.aimLandingRing = new THREE.Mesh(landRingGeo, this.aimLandingRingMat);
+    this.aimLandingRing.visible = false;
+    scene.add(this.aimLandingRing);
+
+    this.aimDropPositions = new Float32Array(6);
+    const dropGeo = new THREE.BufferGeometry();
+    dropGeo.setAttribute('position', new THREE.BufferAttribute(this.aimDropPositions, 3));
+    this.aimDropMat = new THREE.LineBasicMaterial({
+      color: 0x7ef9ff,
+      transparent: true,
+      opacity: 0.35,
+    });
+    this.aimDropLine = new THREE.Line(dropGeo, this.aimDropMat);
+    this.aimDropLine.frustumCulled = false;
+    this.aimDropLine.visible = false;
+    scene.add(this.aimDropLine);
+  }
+
+  private updateAimIndicator(
+    room: RoomState,
+    entity: Entity,
+    tank: PlayerTankState,
+    suit: SuitActionState,
+    mode: GravityMode,
+    nozzlePressureRank: number,
+  ): void {
+    const chamber = getActiveChamber(tank);
+    const loaded = chamber.liters > 0 && chamber.mat !== MAT.AIR;
+    const colorHex = loaded
+      ? chamber.mat === MAT.OIL
+        ? 0xd4955a
+        : (MATERIAL_SPEC[chamber.mat]?.colorHex ?? 0x7ef9ff)
+      : 0x7ef9ff;
+    this.aimArcMat.color.setHex(colorHex);
+    this.aimLandingRingMat.color.setHex(colorHex);
+    this.aimDropMat.color.setHex(colorHex);
+
+    const ox = entity.x + suit.aimDirX * 0.42;
+    const oy = entity.y + PLAYER_TORSO_OFFSET_M + suit.aimDirY * 0.42;
+    const oz = entity.z + suit.aimDirZ * 0.42;
+
+    let endX = ox;
+    let endY = oy;
+    let endZ = oz;
+    let usedPts = 1;
+
+    this.aimArcPositions[0] = ox;
+    this.aimArcPositions[1] = oy;
+    this.aimArcPositions[2] = oz;
+
+    if (loaded && mode !== GRAVITY_MODE.G0) {
+      const speed =
+        (suit.nozzleHoseActive ? NOZZLE_HOLD_SPEED_M_S : NOZZLE_TAP_SPEED_M_S) *
+        nozzlePressureMult(nozzlePressureRank);
+      const gAccel = GRAVITY_ACCEL_BY_MODE[mode];
+      const dtStep = 0.032;
+      let px = ox;
+      let py = oy;
+      let pz = oz;
+      let vx = suit.aimDirX * speed;
+      let vy = suit.aimDirY * speed;
+      let vz = suit.aimDirZ * speed;
+
+      for (let i = 1; i < AIM_ARC_POINTS; i++) {
+        vy += gAccel * dtStep;
+        const nx = px + vx * dtStep;
+        const ny = py + vy * dtStep;
+        const nz = pz + vz * dtStep;
+        const gx = Math.floor(nx / VOXEL_SIZE_M);
+        const gy = Math.floor(ny / VOXEL_SIZE_M);
+        const gz = Math.floor(nz / VOXEL_SIZE_M);
+        const hitSolid =
+          !inRoomBounds(room, gx, gy, gz) || isSolidMat(getMat(room.grid[cellIndex(gx, gy, gz)]));
+        const base = i * 3;
+        if (hitSolid) {
+          this.aimArcPositions[base] = px;
+          this.aimArcPositions[base + 1] = py;
+          this.aimArcPositions[base + 2] = pz;
+          endX = px;
+          endY = py;
+          endZ = pz;
+          usedPts = i + 1;
+          break;
+        }
+        px = nx;
+        py = ny;
+        pz = nz;
+        this.aimArcPositions[base] = px;
+        this.aimArcPositions[base + 1] = py;
+        this.aimArcPositions[base + 2] = pz;
+        endX = px;
+        endY = py;
+        endZ = pz;
+        usedPts = i + 1;
+      }
+    } else {
+      // Straight aim ray (Air Burst or 0G fluid shot) up to 8.0 m or first solid hit
+      const maxDist = loaded ? LOCKON_RANGE_M : AIR_BURST_RANGE_M;
+      const stepM = maxDist / (AIM_ARC_POINTS - 1);
+      for (let i = 1; i < AIM_ARC_POINTS; i++) {
+        const d = i * stepM;
+        const nx = ox + suit.aimDirX * d;
+        const ny = oy + suit.aimDirY * d;
+        const nz = oz + suit.aimDirZ * d;
+        const gx = Math.floor(nx / VOXEL_SIZE_M);
+        const gy = Math.floor(ny / VOXEL_SIZE_M);
+        const gz = Math.floor(nz / VOXEL_SIZE_M);
+        const hitSolid =
+          !inRoomBounds(room, gx, gy, gz) || isSolidMat(getMat(room.grid[cellIndex(gx, gy, gz)]));
+        const base = i * 3;
+        this.aimArcPositions[base] = nx;
+        this.aimArcPositions[base + 1] = ny;
+        this.aimArcPositions[base + 2] = nz;
+        endX = nx;
+        endY = ny;
+        endZ = nz;
+        usedPts = i + 1;
+        if (hitSolid) break;
+      }
+    }
+
+    const arcGeo = this.aimArcLine.geometry as THREE.BufferGeometry;
+    arcGeo.setDrawRange(0, usedPts);
+    (arcGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+
+    // Position landing ring and optional vertical drop-line for 3D isometric depth cue
+    const evx = Math.max(0, Math.min(room.roomW - 1, Math.floor(endX / VOXEL_SIZE_M)));
+    const evz = Math.max(0, Math.min(room.roomD - 1, Math.floor(endZ / VOXEL_SIZE_M)));
+    let floorY = endY;
+    const startVY = Math.max(0, Math.min(room.roomH - 1, Math.floor(endY / VOXEL_SIZE_M)));
+    for (let vy = startVY; vy >= 0; vy--) {
+      if (isSolidMat(getMat(room.grid[cellIndex(evx, vy, evz)]))) {
+        floorY = (vy + 1) * VOXEL_SIZE_M;
+        break;
+      }
+    }
+
+    this.aimLandingRing.position.set(endX, endY + 0.03, endZ);
+    this.aimLandingRing.visible = true;
+
+    if (endY - floorY > 0.25) {
+      this.aimDropPositions[0] = endX;
+      this.aimDropPositions[1] = endY;
+      this.aimDropPositions[2] = endZ;
+      this.aimDropPositions[3] = endX;
+      this.aimDropPositions[4] = floorY + 0.02;
+      this.aimDropPositions[5] = endZ;
+      (this.aimDropLine.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      this.aimDropLine.visible = true;
+      // Place landing ring on the deck below in 0G so alignment over vents/pods is obvious
+      if (!loaded || mode === GRAVITY_MODE.G0) {
+        this.aimLandingRing.position.set(endX, floorY + 0.03, endZ);
+      }
+    } else {
+      this.aimDropLine.visible = false;
+    }
   }
 
   public update(
+    room: RoomState,
     entity: Entity,
     tank: PlayerTankState,
     suit: SuitActionState,
     mode: GravityMode,
     plumb: PlumbLineResult,
+    nozzlePressureRank: number,
     dt: number,
     timeSec: number,
   ): void {
     this.root.position.set(entity.x, entity.y + entity.height * 0.5, entity.z);
 
-    // Face quantized cursor aim direction (falls back to velocity if aim is degenerate)
     const aimHorizSq = suit.aimDirX * suit.aimDirX + suit.aimDirZ * suit.aimDirZ;
     if (aimHorizSq > 1e-4) {
       this.root.rotation.y = Math.atan2(-suit.aimDirX, -suit.aimDirZ);
@@ -201,14 +400,12 @@ export class PlayerRig {
       this.root.rotation.y = Math.atan2(-entity.vx, -entity.vz);
     }
 
-    // Smooth 180-deg gyro boot flip when upSign toggles (+1 <-> -1)
     const targetFlip = entity.upSign === 1 ? 0 : Math.PI;
     const diff = targetFlip - this.currentFlipRad;
     const step = Math.min(Math.abs(diff), 16.0 * dt) * Math.sign(diff);
     this.currentFlipRad += step;
     this.body.rotation.z = this.currentFlipRad;
 
-    // Update diegetic backpack tank fill column
     const chamber = getActiveChamber(tank);
     if (chamber.liters > 0 && chamber.mat !== MAT.AIR) {
       const fill = Math.max(0.05, Math.min(1, chamber.liters / Math.max(1, chamber.capL)));
@@ -222,7 +419,8 @@ export class PlayerRig {
       this.tankFillMesh.visible = false;
     }
 
-    // Update Laser Plumb-Line & Surface Ring
+    this.updateAimIndicator(room, entity, tank, suit, mode, nozzlePressureRank);
+
     if (plumb.visible) {
       const colorHex =
         mode === GRAVITY_MODE.GN1
@@ -253,7 +451,6 @@ export class PlayerRig {
       this.plumbRing.visible = false;
     }
 
-    // Update cosmetic Siphon Ribbon
     if (suit.siphonActive && suit.siphonMat !== MAT.AIR) {
       const hex = MATERIAL_SPEC[suit.siphonMat]?.colorHex ?? 0x5be7ff;
       this.siphonMat.color.setHex(hex);

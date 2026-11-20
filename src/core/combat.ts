@@ -18,7 +18,10 @@ import {
   GRAVITY_ACCEL_BY_MODE,
   GRAVITY_MODE,
   IMPACT_IFRAMES_TICKS,
+  LOCKON_CURSOR_SNAP_M,
   LOCKON_RANGE_M,
+  NOZZLE_HOLD_SPEED_M_S,
+  NOZZLE_TAP_SPEED_M_S,
   MAT,
   MATERIAL_SPEC,
   PLAYER_TORSO_OFFSET_M,
@@ -33,6 +36,7 @@ import {
   WALL_SPLAT_V_MIN,
   nozzlePressureMult,
 } from './balance.ts';
+import { hash32 } from './hash.ts';
 import {
   applyStructuralDamage,
   cellIndex,
@@ -44,6 +48,7 @@ import {
   type VatRecord,
 } from './types.ts';
 import {
+  getActiveChamber,
   getEffectiveMassKg,
   type Entity,
   type InputFrame,
@@ -55,6 +60,49 @@ const IMPULSE_TIMER_TICKS = 36; // 0.6 s (§8.2)
 const AIR_BURST_TAN_25 = 0.4663076581549986; // tan(25 deg), deterministic constant
 const AIR_BURST_RAY_STEP = AIR_BURST_TAN_25 * 0.7071067811865475 * 0.5;
 const airBurstHitIndices = new Int32Array(25);
+
+/**
+ * Computes a deterministic normalized aim direction from (ox,oy,oz) to (tx,ty,tz).
+ * When speed > 0 and gravity is non-zero, solves the low-angle ballistic pitch so fluid
+ * lands directly on the targeted voxel (clamping to a clean max-range lob if out of reach).
+ */
+export function computeBallisticAimDir(
+  ox: number,
+  oy: number,
+  oz: number,
+  tx: number,
+  ty: number,
+  tz: number,
+  speed: number,
+  gravityAccel: number,
+): [number, number, number] {
+  const dx = tx - ox;
+  const dy = ty - oy;
+  const dz = tz - oz;
+  const horiz = Math.hypot(dx, dz);
+  const dist = Math.hypot(horiz, dy);
+  if (dist < 1e-4) return [0, 0, 1];
+
+  if (speed <= 0 || Math.abs(gravityAccel) < 1e-4 || horiz < 0.08) {
+    return [dx / dist, dy / dist, dz / dist];
+  }
+
+  const gSign = gravityAccel < 0 ? 1 : -1;
+  const g = Math.abs(gravityAccel);
+  const dyEff = dy * gSign;
+  const v2 = speed * speed;
+  const v4 = v2 * v2;
+  const disc = v4 - g * (g * horiz * horiz + 2 * dyEff * v2);
+  let tanTheta = disc >= 0 ? (v2 - Math.sqrt(disc)) / (g * horiz) : 0.36;
+  if (tanTheta < -1.4) tanTheta = -1.4;
+  else if (tanTheta > 0.72) tanTheta = 0.72;
+
+  const ux = dx / horiz;
+  const uz = dz / horiz;
+  const uy = tanTheta * gSign;
+  const invLen = 1 / Math.sqrt(1 + uy * uy);
+  return [ux * invLen, uy * invLen, uz * invLen];
+}
 
 export function computeWallSplatDamage(
   effectiveMassKg: number,
@@ -231,7 +279,7 @@ export function updateMagneticLockOn(world: WorldState, input: InputFrame): void
   const refZ = input.hasAimPoint ? input.aimPointZ : oz + suit.aimDirZ * 4.0;
 
   const maxRangeSq = LOCKON_RANGE_M * LOCKON_RANGE_M;
-  const maxSnapCursorSq = 3.2 * 3.2;
+  const maxSnapCursorSq = LOCKON_CURSOR_SNAP_M * LOCKON_CURSOR_SNAP_M;
 
   let best: LockOnTarget | null = null;
   let bestCursorDistSq = maxSnapCursorSq;
@@ -348,18 +396,28 @@ export function updateMagneticLockOn(world: WorldState, input: InputFrame): void
 
   world.lockOn = best;
 
-  // Aim Model (§5): when locked, aim vector snaps in 3D from torso to target center
+  // Aim Model (§5): when locked, snap aim to target (gravity-compensated when nozzle is loaded)
   if (best !== null) {
     const target: LockOnTarget = best;
-    const dx = target.x - ox;
-    const dy = target.y - oy;
-    const dz = target.z - oz;
-    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (len > 1e-4) {
-      suit.aimDirX = dx / len;
-      suit.aimDirY = dy / len;
-      suit.aimDirZ = dz / len;
-    }
+    const chamber = getActiveChamber(world.playerTank);
+    const loaded = chamber.liters > 0 && chamber.mat !== MAT.AIR;
+    const speed = loaded
+      ? (suit.nozzleHoseActive ? NOZZLE_HOLD_SPEED_M_S : NOZZLE_TAP_SPEED_M_S) *
+        nozzlePressureMult(world.nozzlePressureRank)
+      : 0;
+    const [ax, ay, az] = computeBallisticAimDir(
+      ox,
+      oy,
+      oz,
+      target.x,
+      target.y,
+      target.z,
+      speed,
+      GRAVITY_ACCEL_BY_MODE[room.gravityMode],
+    );
+    suit.aimDirX = ax;
+    suit.aimDirY = ay;
+    suit.aimDirZ = az;
   }
 }
 
@@ -558,7 +616,30 @@ export function fireCompressedAirBurst(world: WorldState): void {
     const rem = idx - vy * SLICE_STRIDE;
     const vz = Math.floor(rem / ARENA_W);
     const vx = rem - vz * ARENA_W;
-    applyStructuralDamage(room, vx, vy, vz, baseDmg * mult, true, world.simTick);
+    if (mat === MAT.ICE) {
+      const h = hash32(room.roomSeed, world.simTick, idx);
+      const spd = 7.5 + 3.5 * ((h & 255) / 255);
+      const sx = (((h >>> 8) & 255) / 127.5 - 1) * 2.2;
+      const sz = (((h >>> 16) & 255) / 127.5 - 1) * 2.2;
+      const sy = 2.8 + 2.4 * (((h >>> 24) & 255) / 255);
+      const hLen = Math.hypot(ax, az);
+      const fx = hLen > 1e-3 ? ax / hLen : 0;
+      const fz = hLen > 1e-3 ? az / hLen : 1;
+      applyStructuralDamage(
+        room,
+        vx,
+        vy,
+        vz,
+        baseDmg * mult,
+        true,
+        world.simTick,
+        fx * spd + sx,
+        Math.max(sy, ay * spd + 2.4),
+        fz * spd + sz,
+      );
+    } else {
+      applyStructuralDamage(room, vx, vy, vz, baseDmg * mult, true, world.simTick);
+    }
   }
 
   // 3. 0G recoil (-2.5 m/s)

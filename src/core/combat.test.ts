@@ -170,6 +170,14 @@ describe('Milestone 1.3-lite — Air Burst, 12 m LOS Lock-On, Crates, Brood Pods
 
     assert.equal(getDamage(room.grid[cellIndex(120, 20, 50)]), 2);
     assert.equal(getMat(room.grid[cellIndex(120, 20, 53)]), MAT.AIR);
+    let foundIceShard = false;
+    for (let bi = 0; bi < room.ballistic.active.length; bi++) {
+      if (room.ballistic.active[bi] && getMat(room.ballistic.packedVoxel[bi]) === MAT.ICE) {
+        assert.ok(room.ballistic.vx[bi] > 2.0 && room.ballistic.vy[bi] > 1.5, `ICE shard must launch outward & up, v=(${room.ballistic.vx[bi]},${room.ballistic.vy[bi]})`);
+        foundIceShard = true;
+      }
+    }
+    assert.ok(foundIceShard, 'shattered ICE spawns launched Ballistic(ICE) shrapnel');
     recomputeRoomLedgers(room, world.playerTank);
     assert.equal(room.ledgers.water, waterWithIce, 'ICE shatter via Air Burst conserves water ledger');
 

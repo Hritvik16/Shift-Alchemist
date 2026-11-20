@@ -40,6 +40,7 @@ import {
   isThermalSolidActiveEligible,
   moveCell,
   packVoxel,
+  queuePhaseExplosion,
   swapCells,
   transitionCell,
   wake26Neighbors,
@@ -78,6 +79,19 @@ const DIR8_TO_SLIDE = [0, 0, 2, 1, 1, 1, 3, 0] as const;
 const FACE_DX = [1, -1, 0, 0, 0, 0] as const;
 const FACE_DY = [0, 0, 1, -1, 0, 0] as const;
 const FACE_DZ = [0, 0, 0, 0, 1, -1] as const;
+
+function fireHasAdjacentFuel(room: RoomState, x: number, y: number, z: number): boolean {
+  const g = room.grid;
+  const idx = cellIndex(x, y, z);
+  const isFuel = (m: number): boolean => m === MAT.OIL || m === MAT.WOOD_BARRIER;
+  if (x > 0 && isFuel(getMat(g[idx - 1]))) return true;
+  if (x + 1 < room.roomW && isFuel(getMat(g[idx + 1]))) return true;
+  if (z > 0 && isFuel(getMat(g[idx - ARENA_W]))) return true;
+  if (z + 1 < room.roomD && isFuel(getMat(g[idx + ARENA_W]))) return true;
+  if (y > 0 && isFuel(getMat(g[idx - SLICE_STRIDE]))) return true;
+  if (y + 1 < room.roomH && isFuel(getMat(g[idx + SLICE_STRIDE]))) return true;
+  return false;
+}
 
 function liquidCentroidBucket(mat: number): number {
   if (mat === MAT.WATER) return 0;
@@ -675,6 +689,14 @@ function applyBallisticImpactTransitionOrPlace(
       world.simTick,
     );
     if (ok) {
+      const playerOnly = (bp.flags[slot] & BALLISTIC_FLAG.FIRED_BY_PLAYER) !== 0;
+      queuePhaseExplosion(
+        room,
+        (targetX + 0.5) * VOXEL_SIZE_M,
+        (targetY + 0.5) * VOXEL_SIZE_M,
+        (targetZ + 0.5) * VOXEL_SIZE_M,
+        playerOnly,
+      );
       deactivateBallistic(room, slot);
       return true;
     }
@@ -683,6 +705,17 @@ function applyBallisticImpactTransitionOrPlace(
 
   if (mat === MAT.CRYO && temp >= TEMP_BYTE.FREEZE) {
     room.ledgers.cryoBoiledOff++;
+    if (temp >= TEMP_BYTE.BOIL) {
+      const playerOnly = (bp.flags[slot] & BALLISTIC_FLAG.FIRED_BY_PLAYER) !== 0;
+      queuePhaseExplosion(
+        room,
+        (targetX + 0.5) * VOXEL_SIZE_M,
+        (targetY + 0.5) * VOXEL_SIZE_M,
+        (targetZ + 0.5) * VOXEL_SIZE_M,
+        playerOnly,
+        'cryo',
+      );
+    }
     deactivateBallistic(room, slot);
     return true;
   }
@@ -867,6 +900,10 @@ export function stepBallisticsStage3(world: WorldState): void {
           hitEntity.vy += (vy / speed) * dv;
           hitEntity.vz += (vz / speed) * dv;
           if (hitEntity !== player && dv > 0.2) hitEntity.impulseTimer = 36;
+          if (curMat === MAT.ICE && hitEntity !== player && speed >= 4.0) {
+            const brittleMult = hitEntity.tempByte <= TEMP_BYTE.EMBRITTLED ? 3 : 1;
+            hitEntity.hp = Math.max(0, hitEntity.hp - 4 * brittleMult);
+          }
         }
         const tx = hasLastAir ? lastAirX : gx;
         const ty = hasLastAir ? lastAirY : gy;
@@ -1151,6 +1188,10 @@ function stepSingleFluidSubPass(
 
     if (isZeroG) {
       if (isGasOrPlasmaMat(mat)) {
+        const fireAnchored =
+          mat === MAT.FIRE &&
+          ((getTimerOrCharge(val) > 20 && fireHasAdjacentFuel(room, x, y, z)) || (simTick & 1) !== 0);
+        if (!fireAnchored) {
         // Isotropic seeded 6-neighbor step in 0G
         const startFace = hash32(room.roomSeed, simTick, idx) % 6;
         for (let k = 0; k < 6; k++) {
@@ -1165,6 +1206,7 @@ function stepSingleFluidSubPass(
             movedToIdx = cellIndex(nx, ny, nz);
             break;
           }
+        }
         }
       } else if (world.zeroGLoftTicksLeft > 0) {
         // CA-driven room-wide 0G loft (§6.2, D6): 0 ballistic slots consumed
@@ -1242,6 +1284,10 @@ function stepSingleFluidSubPass(
         }
       }
     } else if (isGasOrPlasmaMat(mat)) {
+      const fireAnchored =
+        mat === MAT.FIRE &&
+        ((getTimerOrCharge(val) > 20 && fireHasAdjacentFuel(room, x, y, z)) || (simTick & 1) !== 0);
+      if (!fireAnchored) {
       // Rule 1B: Explicit Upward Buoyancy (-dirY), Grate Permeation (GRATE_MAX_RUN=2), Gas/Liquid Swaps
       const upY = y - dirY;
       if (upY >= 1 && upY < room.roomH - 1) {
@@ -1286,6 +1332,7 @@ function stepSingleFluidSubPass(
           moveCell(room, x, y, z, hx, y, hz, simTick);
           movedToIdx = cellIndex(hx, y, hz);
         }
+      }
       }
     } else {
       // Liquids (WATER, OIL, CRYO, ACID)

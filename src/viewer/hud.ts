@@ -5,6 +5,7 @@ import {
   GRAVITY_MODE,
   MAT,
   MATERIAL_SPEC,
+  TEMP_BYTE,
   byteToTempC,
   gravCooldownS,
 } from '../core/balance.ts';
@@ -116,6 +117,20 @@ export class SuitHud {
     const hpDisplay = Math.ceil(p.hp);
     const hpPct = Math.max(0, Math.min(100, (p.hp / p.maxHp) * 100));
 
+    const badges: string[] = [];
+    if (p.burnTicks > 0) {
+      badges.push('<span style="color:#ff7b29;font-weight:bold">BURN</span>');
+    }
+    if (p.tempByte <= TEMP_BYTE.EMBRITTLED) {
+      badges.push('<span style="color:#7ef9ff;font-weight:bold">BRITTLE 3x</span>');
+    } else if (p.tempByte !== TEMP_BYTE.AMBIENT) {
+      badges.push(`<span style="color:#9db2cc">${byteToTempC(p.tempByte)}°C</span>`);
+    }
+    if (p.wetTicks > 0) {
+      badges.push('<span style="color:#48bfe3;font-weight:bold">WET</span>');
+    }
+    const statusHtml = badges.length > 0 ? ` ${badges.join(' ')}` : '';
+
     let modeColor = '#5ef2d6';
     if (mode === GRAVITY_MODE.G0) modeColor = '#58c4ff';
     else if (mode === GRAVITY_MODE.G2 || mode === GRAVITY_MODE.G3) modeColor = '#ffaa2b';
@@ -162,7 +177,7 @@ export class SuitHud {
 
     this.el.innerHTML =
       `<div style="display:flex;justify-content:space-between;margin-bottom:3px">` +
-      `<span>SUIT HP</span><strong style="color:${hpDisplay <= 30 ? '#ff6b6b' : '#5ef2d6'}">${hpDisplay} / ${p.maxHp}</strong>` +
+      `<span>SUIT HP${statusHtml}</span><strong style="color:${hpDisplay <= 30 ? '#ff6b6b' : '#5ef2d6'}">${hpDisplay} / ${p.maxHp}</strong>` +
       `</div>` +
       `<div style="height:6px;background:#1c2433;border-radius:3px;overflow:hidden;margin-bottom:8px">` +
       `<div style="height:100%;width:${hpPct.toFixed(1)}%;background:${hpDisplay <= 30 ? '#ff6b6b' : '#3be8b0'}"></div>` +

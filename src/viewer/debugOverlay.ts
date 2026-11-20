@@ -16,6 +16,8 @@ export interface DebugMetrics {
   meshMemMB: number;
   decalCount: number;
   activeFluidCount: number;
+  activeThermalCount: number;
+  explosionQueueCount: number;
   ballisticCount: number;
   deferredCount: number;
   renderedGridFluid: number;
@@ -82,12 +84,12 @@ export class DebugOverlay {
     const d = m.ledgerDrift;
     const totalDrift = Math.abs(d.water) + Math.abs(d.oil) + Math.abs(d.cryo) + Math.abs(d.acid);
     this.el.textContent =
-      `SHIFT ALCHEMIST v2 [M1.3-lite Air Burst, Lock-On & Pods]${m.adaptiveFallback ? ' [FALLBACK 8/f]' : ''}\n` +
+      `SHIFT ALCHEMIST v2 [M2.2-lite Tier A Complete]${m.adaptiveFallback ? ' [FALLBACK 8/f]' : ''}\n` +
       `FPS: ${m.fps.toFixed(1)} | p95: ${m.p95Ms.toFixed(2)}ms | p99: ${m.p99Ms.toFixed(2)}ms\n` +
       `Sim: ${m.simMs.toFixed(2)}ms | Render: ${m.renderMs.toFixed(2)}ms | Tick: ${m.simTick}\n` +
       `Draw Calls: ${m.drawCalls} | Tris: ${m.triangles.toLocaleString()}\n` +
       `Chunks: ${m.meshedChunks} | Mesh Q: ${m.dirtyQueue} | Fluid Q: ${m.dirtyFluidQueue} | Mem: ${m.meshMemMB.toFixed(2)}MB\n` +
-      `Fluid Active: ${m.activeFluidCount}/16384 | Ballistic: ${m.ballisticCount}/4096 | Def: ${m.deferredCount}\n` +
+      `Fluid Active: ${m.activeFluidCount}/16384 | Thermal: ${m.activeThermalCount}/8192 | Ball: ${m.ballisticCount}/4096 | ExplQ: ${m.explosionQueueCount}\n` +
       `Fluid Inst: ${m.renderedGridFluid} grid + ${m.renderedBallistic} ball = ${m.renderedGridFluid + m.renderedBallistic}/28672\n` +
       `Pos: (${m.playerX.toFixed(2)}, ${m.playerY.toFixed(2)}, ${m.playerZ.toFixed(2)}) vy=${m.playerVy.toFixed(1)} | Mass=${m.playerMassKg.toFixed(0)}kg\n` +
       `Tank: ${m.tankSummary} | Siphon=${m.siphonActive ? 'ON' : 'off'}\n` +
@@ -95,7 +97,7 @@ export class DebugOverlay {
       `Grav: ${m.gravityMode} | upSign=${m.upSign > 0 ? '+1' : '-1'} | Grounded=${m.grounded ? 'Y' : 'N'} | Plumb=${m.plumbDistM.toFixed(2)}m\n` +
       `Last Impact: ${impTag}\n` +
       `Hover: ${m.hoveredInfo} | Decals: ${m.decalCount}/512\n` +
-      `Ledgers (L): W=${m.ledgers.water} O=${m.ledgers.oil} C=${m.ledgers.cryo}(sub:${m.ledgers.cryoBoiledOff}) A=${m.ledgers.acid} | Drift=${totalDrift}\n` +
+      `Ledgers (L): W=${m.ledgers.water} O=${m.ledgers.oil}(comb:${m.ledgers.oilCombusted}) C=${m.ledgers.cryo}(sub:${m.ledgers.cryoBoiledOff}) A=${m.ledgers.acid} | Drift=${totalDrift}\n` +
       `───────────────────────────────────────────────\n` +
       `WASD: Move | E/Shift: 0G +/-Y | Space: Jetpack Dash (24L)\n` +
       `LMB: Air Burst (Empty) / Fluid Nozzle | RMB: Siphon (6m)\n` +

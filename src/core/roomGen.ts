@@ -123,6 +123,7 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
   room.roomD = CARGO_HOLD_DIMS.d;
   room.gravityMode = GRAVITY_MODE.G1;
   room.vats.length = 0;
+  room.emitters.length = 0;
   room.doors.length = 0;
   room.ledgers = {
     water: 0,
@@ -215,6 +216,18 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
   fillBox(room, 66, CARGO_DECK_TOP_Y, 64, 95, CARGO_DECK_TOP_Y + 19, 66, MAT.WOOD_BARRIER);
   fillBox(room, 174, CARGO_DECK_TOP_Y, 102, 176, CARGO_DECK_TOP_Y + 19, 131, MAT.WOOD_BARRIER);
   fillBox(room, 96, CARGO_DECK_TOP_Y, 188, 125, CARGO_DECK_TOP_Y + 19, 190, MAT.WOOD_BARRIER);
+
+  // Thermal Steam Vent: 0.3 m (3-voxel) floor-mounted HULL_STEEL housing (+300C plume above, §9)
+  fillBox(room, 157, CARGO_DECK_TOP_Y, 193, 159, CARGO_DECK_TOP_Y + 2, 195, MAT.HULL_STEEL);
+  room.emitters.push({
+    kind: 'vent',
+    x: 158,
+    y: CARGO_DECK_TOP_Y,
+    z: 194,
+    faceDir: '+Y',
+    timer: 0,
+    reserveL: 0,
+  });
 
   reseedActiveLists(room, 1);
 

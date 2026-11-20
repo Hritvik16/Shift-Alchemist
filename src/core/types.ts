@@ -5,6 +5,7 @@ import {
   ARENA_W,
   CHUNKS_X,
   CHUNKS_Z,
+  EXPLOSION_COALESCE_M,
   GRAVITY_MODE,
   MAT,
   MATERIAL_SPEC,
@@ -12,6 +13,7 @@ import {
   MAX_ACTIVE_GRID_FLUID,
   MAX_ACTIVE_THERMAL_SOLIDS,
   MAX_DEFERRED_FLUID,
+  MAX_EXPLOSION_QUEUE,
   SLICE_STRIDE,
   TEMP_BYTE,
   TOTAL_CHUNKS,
@@ -155,6 +157,37 @@ export interface VatRecord {
   interiorLiters: number;
 }
 
+export interface HazardEmitter {
+  kind: 'vent' | 'conduit' | 'cryo_pipe';
+  x: number;
+  y: number;
+  z: number;
+  faceDir: '+Y' | '+X' | '-X' | '+Z' | '-Z';
+  timer: number;
+  reserveL: number;
+}
+
+export type ExplosionKind = 'steam' | 'cryo';
+
+export interface ExplosionWave {
+  x: number;
+  y: number;
+  z: number;
+  playerOnly: boolean;
+  intensity: number;
+  kind: ExplosionKind;
+}
+
+export interface ExplosionVisualEvent {
+  x: number;
+  y: number;
+  z: number;
+  radiusM: number;
+  intensity: number;
+  tick: number;
+  kind: ExplosionKind;
+}
+
 export interface DoorRecord {
   face: 'N' | 'S' | 'E' | 'W';
   minX: number;
@@ -253,6 +286,9 @@ export interface RoomState {
   pendingVatShatters: number[];
   sublimationEvents: Float32Array;
   sublimationEventCount: number;
+  emitters: HazardEmitter[];
+  explosionQueue: ExplosionWave[];
+  recentExplosions: ExplosionVisualEvent[];
   vats: VatRecord[];
   doors: DoorRecord[];
   ledgers: ConservationLedgers;
@@ -327,6 +363,9 @@ export function createEmptyRoomState(roomSeed = 1): RoomState {
     pendingVatShatters: [],
     sublimationEvents: new Float32Array(128 * 3),
     sublimationEventCount: 0,
+    emitters: [],
+    explosionQueue: [],
+    recentExplosions: [],
     vats: [],
     doors: [],
     ledgers: {
@@ -375,6 +414,8 @@ export function resetRoomRuntimeTransient(room: RoomState): void {
   room.deferredFluid.count = 0;
   room.pendingVatShatters.length = 0;
   room.sublimationEventCount = 0;
+  room.explosionQueue.length = 0;
+  room.recentExplosions.length = 0;
 }
 
 export function inRoomBounds(room: RoomState, x: number, y: number, z: number): boolean {
@@ -389,12 +430,13 @@ export function isExposedThermalSolid(
 ): boolean {
   const g = room.grid;
   const idx = cellIndex(x, y, z);
-  if (x > 0 && !isSolidMat(getMat(g[idx - 1]))) return true;
-  if (x + 1 < room.roomW && !isSolidMat(getMat(g[idx + 1]))) return true;
-  if (z > 0 && !isSolidMat(getMat(g[idx - ARENA_W]))) return true;
-  if (z + 1 < room.roomD && !isSolidMat(getMat(g[idx + ARENA_W]))) return true;
-  if (y > 0 && !isSolidMat(getMat(g[idx - SLICE_STRIDE]))) return true;
-  if (y + 1 < room.roomH && !isSolidMat(getMat(g[idx + SLICE_STRIDE]))) return true;
+  const exposes = (m: number): boolean => !isSolidMat(m) || m === MAT.ICE;
+  if (x > 0 && exposes(getMat(g[idx - 1]))) return true;
+  if (x + 1 < room.roomW && exposes(getMat(g[idx + 1]))) return true;
+  if (z > 0 && exposes(getMat(g[idx - ARENA_W]))) return true;
+  if (z + 1 < room.roomD && exposes(getMat(g[idx + ARENA_W]))) return true;
+  if (y > 0 && exposes(getMat(g[idx - SLICE_STRIDE]))) return true;
+  if (y + 1 < room.roomH && exposes(getMat(g[idx + SLICE_STRIDE]))) return true;
   return false;
 }
 
@@ -411,7 +453,7 @@ export function isThermalSolidActiveEligible(
   const charge = getTimerOrCharge(val);
   if (charge > 0) return true;
   const temp = getTempByte(val);
-  if (mat === MAT.ICE) return temp < TEMP_BYTE.FREEZE;
+  if (mat === MAT.ICE) return temp !== TEMP_BYTE.FREEZE;
   return temp !== TEMP_BYTE.AMBIENT;
 }
 
@@ -707,6 +749,9 @@ export function applyStructuralDamage(
   damageDelta: number,
   allowIceShatter = false,
   simTick = 1,
+  launchVx = 0,
+  launchVy = 0,
+  launchVz = 0,
 ): boolean {
   if (!inRoomBounds(room, x, y, z) || damageDelta <= 0) return false;
   const idx = cellIndex(x, y, z);
@@ -743,12 +788,12 @@ export function applyStructuralDamage(
       }
       bp.active[slot] = 1;
       bp.x[slot] = (x + 0.5) * VOXEL_SIZE_M;
-      bp.y[slot] = (y + 0.5) * VOXEL_SIZE_M;
+      bp.y[slot] = (y + 0.5) * VOXEL_SIZE_M + (launchVy > 0 ? 0.04 : 0);
       bp.z[slot] = (z + 0.5) * VOXEL_SIZE_M;
-      bp.vx[slot] = 0;
-      bp.vy[slot] = 0;
-      bp.vz[slot] = 0;
-      bp.packedVoxel[slot] = (val & ~(1 << 22)) >>> 0;
+      bp.vx[slot] = launchVx;
+      bp.vy[slot] = launchVy;
+      bp.vz[slot] = launchVz;
+      bp.packedVoxel[slot] = ((val & 0x0fffffff) & ~(1 << 22)) >>> 0;
       bp.flightTicks[slot] = 0;
       bp.fuseTicks[slot] = 0;
       bp.flags[slot] = 0;
@@ -1010,4 +1055,46 @@ export function recomputeRoomLedgers(room: RoomState, playerTank?: TankLedgerVie
   room.ledgers.oil = oil + room.ledgers.oilCombusted;
   room.ledgers.cryo = cryo + room.ledgers.cryoBoiledOff;
   room.ledgers.acid = acid + room.ledgers.acidConsumed;
+}
+
+/**
+ * Bounded coalesced Phase Explosion queue (§6.1 Stage 6):
+ * Coalesces within 1.2 m; excess above cap 32 merges only cosmetic intensity into nearest wave.
+ */
+export function queuePhaseExplosion(
+  room: RoomState,
+  xM: number,
+  yM: number,
+  zM: number,
+  playerOnly = false,
+  kind: ExplosionKind = 'steam',
+): void {
+  const q = room.explosionQueue;
+  const coalSq = EXPLOSION_COALESCE_M * EXPLOSION_COALESCE_M;
+  let nearestIdx = -1;
+  let nearestDistSq = Infinity;
+
+  for (let i = 0; i < q.length; i++) {
+    const w = q[i];
+    const dx = w.x - xM;
+    const dy = w.y - yM;
+    const dz = w.z - zM;
+    const dSq = dx * dx + dy * dy + dz * dz;
+    if (dSq <= coalSq) {
+      w.playerOnly = w.playerOnly && playerOnly;
+      if (kind === 'cryo') w.kind = 'cryo';
+      if (w.intensity < 8) w.intensity++;
+      return;
+    }
+    if (dSq < nearestDistSq) {
+      nearestDistSq = dSq;
+      nearestIdx = i;
+    }
+  }
+
+  if (q.length < MAX_EXPLOSION_QUEUE) {
+    q.push({ x: xM, y: yM, z: zM, playerOnly, intensity: 1, kind });
+  } else if (nearestIdx >= 0) {
+    if (q[nearestIdx].intensity < 8) q[nearestIdx].intensity++;
+  }
 }

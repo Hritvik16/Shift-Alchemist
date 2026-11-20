@@ -31,8 +31,12 @@ import {
   stepBallisticsStage3,
   stepFluidMovementStage4,
   stepFluidStage8,
-  stepMinimalCryoWarming,
 } from './fluids.ts';
+import {
+  stepEntityFluidSamplingStage8,
+  stepPhaseExplosionsStage6,
+  stepReactionsStage5,
+} from './reactions.ts';
 import {
   applyCrateBuoyancy,
   computeWallSplatDamage,
@@ -516,10 +520,14 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
   // Stage 4: 60 Hz Fluid & Gas Movement CA
   stepFluidMovementStage4(world);
 
-  // M2.1 minimal CRYO finite floor/0G warming
-  stepMinimalCryoWarming(world);
+  // Stage 5: 15 Hz Cellular Reactions & 1 Hz Ambient Relaxation
+  stepReactionsStage5(world);
 
-  // Stage 8: Deferred retries, overflow scanners, deaths/clear & bit-22 cleanup
+  // Stage 6: Coalesced Phase Explosions
+  stepPhaseExplosionsStage6(world);
+
+  // Stage 8: Entity fluid sampling/DOTs, deferred retries, overflow scanners, deaths/clear & bit-22 cleanup
+  stepEntityFluidSamplingStage8(world);
   stepFluidStage8(world);
   resolveStage8DeathsAndClear(world);
 }

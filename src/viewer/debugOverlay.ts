@@ -28,6 +28,9 @@ export interface DebugMetrics {
   playerMassKg: number;
   tankSummary: string;
   siphonActive: boolean;
+  lockOnInfo: string;
+  podsInfo: string;
+  entityCount: number;
   upSign: 1 | -1;
   grounded: boolean;
   gravityMode: GravityMode;
@@ -79,7 +82,7 @@ export class DebugOverlay {
     const d = m.ledgerDrift;
     const totalDrift = Math.abs(d.water) + Math.abs(d.oil) + Math.abs(d.cryo) + Math.abs(d.acid);
     this.el.textContent =
-      `SHIFT ALCHEMIST v2 [M3.1 Suit Tank, Siphon, Nozzle & Dash]${m.adaptiveFallback ? ' [FALLBACK 8/f]' : ''}\n` +
+      `SHIFT ALCHEMIST v2 [M1.3-lite Air Burst, Lock-On & Pods]${m.adaptiveFallback ? ' [FALLBACK 8/f]' : ''}\n` +
       `FPS: ${m.fps.toFixed(1)} | p95: ${m.p95Ms.toFixed(2)}ms | p99: ${m.p99Ms.toFixed(2)}ms\n` +
       `Sim: ${m.simMs.toFixed(2)}ms | Render: ${m.renderMs.toFixed(2)}ms | Tick: ${m.simTick}\n` +
       `Draw Calls: ${m.drawCalls} | Tris: ${m.triangles.toLocaleString()}\n` +
@@ -88,14 +91,15 @@ export class DebugOverlay {
       `Fluid Inst: ${m.renderedGridFluid} grid + ${m.renderedBallistic} ball = ${m.renderedGridFluid + m.renderedBallistic}/28672\n` +
       `Pos: (${m.playerX.toFixed(2)}, ${m.playerY.toFixed(2)}, ${m.playerZ.toFixed(2)}) vy=${m.playerVy.toFixed(1)} | Mass=${m.playerMassKg.toFixed(0)}kg\n` +
       `Tank: ${m.tankSummary} | Siphon=${m.siphonActive ? 'ON' : 'off'}\n` +
+      `Lock: ${m.lockOnInfo} | Pods: ${m.podsInfo} | Entities: ${m.entityCount}/32\n` +
       `Grav: ${m.gravityMode} | upSign=${m.upSign > 0 ? '+1' : '-1'} | Grounded=${m.grounded ? 'Y' : 'N'} | Plumb=${m.plumbDistM.toFixed(2)}m\n` +
       `Last Impact: ${impTag}\n` +
       `Hover: ${m.hoveredInfo} | Decals: ${m.decalCount}/512\n` +
       `Ledgers (L): W=${m.ledgers.water} O=${m.ledgers.oil} C=${m.ledgers.cryo}(sub:${m.ledgers.cryoBoiledOff}) A=${m.ledgers.acid} | Drift=${totalDrift}\n` +
       `───────────────────────────────────────────────\n` +
       `WASD: Move | E/Shift: 0G +/-Y | Space: Jetpack Dash (24L)\n` +
-      `LMB: Nozzle (Tap 15L / Hold 60L/s) | RMB: Siphon (6m)\n` +
-      `Q: 1G<->0G / Cancel | C: 2G (3s) | V: -1G (3.5s) | Wheel: Zoom\n` +
+      `LMB: Air Burst (Empty) / Fluid Nozzle | RMB: Siphon (6m)\n` +
+      `Q: 1G<->0G / Cancel | C: 2G (3s) | V: -1G (3.5s) | F: New Run\n` +
       `1-6: Carve Sphere | MMB: 2 Dmg Poke | F3: Overlay`;
   }
 }

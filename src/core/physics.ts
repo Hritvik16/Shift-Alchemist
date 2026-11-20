@@ -13,9 +13,6 @@ import {
   PLAYER_SPEED_N1G,
   TEMP_BYTE,
   VOXEL_SIZE_M,
-  WALL_SPLAT_BASE_CAP,
-  WALL_SPLAT_COEFF,
-  WALL_SPLAT_EMBRITTLED_CAP,
   WALL_SPLAT_V_MIN,
   type GravityMode,
 } from './balance.ts';
@@ -36,7 +33,15 @@ import {
   stepFluidStage8,
   stepMinimalCryoWarming,
 } from './fluids.ts';
+import {
+  applyCrateBuoyancy,
+  computeWallSplatDamage,
+  resolveEntityEntityCollisions,
+  resolveStage8DeathsAndClear,
+} from './combat.ts';
 import { applyDashVelocityIfActive, stepSuitActionsStage1 } from './suit.ts';
+
+export { computeWallSplatDamage };
 import {
   getEffectiveMassKg,
   getFeetY,
@@ -188,19 +193,6 @@ function applyWallImpactToSolidFace(
   }
 }
 
-export function computeWallSplatDamage(
-  effectiveMassKg: number,
-  normalImpactSpeed: number,
-  targetTempByte: number,
-): number {
-  if (normalImpactSpeed <= WALL_SPLAT_V_MIN) return 0;
-  const excess = normalImpactSpeed - WALL_SPLAT_V_MIN;
-  const base = Math.min(WALL_SPLAT_BASE_CAP, WALL_SPLAT_COEFF * effectiveMassKg * excess * excess);
-  const embrittled = targetTempByte <= TEMP_BYTE.EMBRITTLED;
-  const dmg = embrittled ? Math.min(WALL_SPLAT_EMBRITTLED_CAP, base * 3.0) : base;
-  return Math.round(dmg);
-}
-
 function resolveSolidImpact(
   world: WorldState,
   entity: Entity,
@@ -260,6 +252,9 @@ export function integrateEntityVoxelPhysics(
   // Apply gravity acceleration (suspended during active Jetpack Dash so horizontal dashes cross gaps cleanly)
   if (mode !== GRAVITY_MODE.G0 && !wasDashing) {
     entity.vy += gAccel * FIXED_DT;
+  }
+  if (entity.kind === 'crate') {
+    applyCrateBuoyancy(world, entity);
   }
 
   const isPlayerExempt = entity.kind === 'player' && world.gravityPulse.ownPulseExempt;
@@ -492,6 +487,21 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
 
   // Stage 2: Entity Kinematics & Swept AABB Voxel Collisions
   integrateEntityVoxelPhysics(world, player);
+  for (let i = 0; i < world.entities.length; i++) {
+    const e = world.entities[i];
+    if (e.hp <= 0 || e.deathHusk) continue;
+    const drag = mode === GRAVITY_MODE.G0 ? 0.985 : e.grounded ? (e.impulseTimer > 0 ? 0.965 : 0.88) : 0.992;
+    e.vx *= drag;
+    e.vz *= drag;
+    if (Math.abs(e.vx) < 0.01) e.vx = 0;
+    if (Math.abs(e.vz) < 0.01) e.vz = 0;
+    if (mode === GRAVITY_MODE.G0) {
+      e.vy *= 0.985;
+      if (Math.abs(e.vy) < 0.01) e.vy = 0;
+    }
+    integrateEntityVoxelPhysics(world, e);
+  }
+  resolveEntityEntityCollisions(world);
 
   // Process vat shatters & gravity-shift reseed
   processPendingVatShatters(world);
@@ -509,8 +519,9 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
   // M2.1 minimal CRYO finite floor/0G warming
   stepMinimalCryoWarming(world);
 
-  // Stage 8: Deferred retries, overflow scanners & bit-22 cleanup
+  // Stage 8: Deferred retries, overflow scanners, deaths/clear & bit-22 cleanup
   stepFluidStage8(world);
+  resolveStage8DeathsAndClear(world);
 }
 
 export function computePlumbLine(room: RoomState, entity: Entity): PlumbLineResult {

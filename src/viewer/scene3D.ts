@@ -711,13 +711,21 @@ export class Scene3D {
     return hit;
   }
 
-  public computeTorsoAimDirection(
+  public computeTorsoAim(
     playerX: number,
     playerY: number,
     playerZ: number,
     clientX: number,
     clientY: number,
-  ): [number, number, number] {
+  ): {
+    aimX: number;
+    aimY: number;
+    aimZ: number;
+    hasAimPoint: boolean;
+    aimPointX: number;
+    aimPointY: number;
+    aimPointZ: number;
+  } {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.mouseNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     this.mouseNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
@@ -726,16 +734,42 @@ export class Scene3D {
     const torsoY = playerY + 0.8;
     this.aimPlane.constant = -torsoY;
     const hit = this.raycaster.ray.intersectPlane(this.aimPlane, this.aimHit);
-    if (!hit) return [0, 0, 1];
+    if (!hit) {
+      return {
+        aimX: 0,
+        aimY: 0,
+        aimZ: 1,
+        hasAimPoint: false,
+        aimPointX: playerX,
+        aimPointY: torsoY,
+        aimPointZ: playerZ + 4,
+      };
+    }
 
     const dx = this.aimHit.x - playerX;
     const dz = this.aimHit.z - playerZ;
     const len = Math.sqrt(dx * dx + dz * dz);
-    if (len < 1e-4) return [0, 0, 1];
+    const qx = len >= 1e-4 ? Math.round((dx / len) * 1024) / 1024 : 0;
+    const qz = len >= 1e-4 ? Math.round((dz / len) * 1024) / 1024 : 1;
+    return {
+      aimX: qx,
+      aimY: 0,
+      aimZ: qz,
+      hasAimPoint: true,
+      aimPointX: Math.round(this.aimHit.x * 1024) / 1024,
+      aimPointY: Math.round(torsoY * 1024) / 1024,
+      aimPointZ: Math.round(this.aimHit.z * 1024) / 1024,
+    };
+  }
 
-    const qx = Math.round((dx / len) * 1024) / 1024;
-    const qz = Math.round((dz / len) * 1024) / 1024;
-    return [qx, 0, qz];
+  public resetRoomVisuals(): void {
+    for (let c = 0; c < TOTAL_CHUNKS; c++) {
+      this.decalPositionsByChunk[c].length = 0;
+    }
+    this.decalCount = 0;
+    this.totalDecalCandidates = 0;
+    this.decalMesh.count = 0;
+    this.decalMesh.instanceMatrix.needsUpdate = true;
   }
 
   public describeHit(hit: VoxelRayHit | null): string {

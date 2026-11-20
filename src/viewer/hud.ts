@@ -23,7 +23,7 @@ function renderChamberBlock(
   const pct = Math.max(0, Math.min(100, (chamber.liters / Math.max(1, chamber.capL)) * 100));
   const empty = chamber.liters <= 0 || chamber.mat === MAT.AIR;
   const spec = MATERIAL_SPEC[chamber.mat];
-  const matName = empty ? 'EMPTY' : spec.name;
+  const matName = empty ? 'AIR BURST' : spec.name;
   const barCol = empty ? '#3a4659' : formatHexCss(spec.colorHex);
   const tempStr = empty ? '' : ` ${byteToTempC(chamber.tempByte)}°C`;
   const chargeStr = !empty && chamber.chargeUnits > 0 ? ` +${chamber.chargeUnits * 2}V` : '';
@@ -35,7 +35,7 @@ function renderChamberBlock(
   return (
     `<div style="margin-bottom:6px">` +
     `<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">` +
-    `<span>${label}${activeBadge} <strong style="color:${empty ? '#889bb5' : barCol}">${matName}</strong>${tempStr}` +
+    `<span>${label}${activeBadge} <strong style="color:${empty ? '#8ecae6' : barCol}">${matName}</strong>${tempStr}` +
     `${chargeStr ? `<strong style="color:#7ef9ff">${chargeStr}</strong>` : ''}</span>` +
     `<span>${chamber.liters}/${chamber.capL} L</span>` +
     `</div>` +
@@ -48,6 +48,8 @@ function renderChamberBlock(
 
 export class SuitHud {
   private readonly el: HTMLDivElement;
+  private readonly objectiveEl: HTMLDivElement;
+  private readonly bannerEl: HTMLDivElement;
 
   constructor(parent: HTMLElement) {
     this.el = document.createElement('div');
@@ -67,6 +69,44 @@ export class SuitHud {
       'min-width:265px',
     ].join(';');
     parent.appendChild(this.el);
+
+    this.objectiveEl = document.createElement('div');
+    this.objectiveEl.style.cssText = [
+      'position:fixed',
+      'top:14px',
+      'right:14px',
+      'z-index:15',
+      'background:rgba(10,14,22,0.84)',
+      'border:1px solid rgba(255,77,121,0.45)',
+      'border-radius:6px',
+      'padding:8px 14px',
+      'color:#dcecf8',
+      'font-size:12px',
+      'line-height:1.45',
+      'pointer-events:none',
+      'text-align:right',
+    ].join(';');
+    parent.appendChild(this.objectiveEl);
+
+    this.bannerEl = document.createElement('div');
+    this.bannerEl.style.cssText = [
+      'position:fixed',
+      'top:22%',
+      'left:50%',
+      'transform:translateX(-50%)',
+      'z-index:25',
+      'background:rgba(10,16,26,0.92)',
+      'border:2px solid #5ef2d6',
+      'border-radius:8px',
+      'padding:16px 26px',
+      'color:#e8f6ff',
+      'font-size:14px',
+      'line-height:1.6',
+      'text-align:center',
+      'pointer-events:none',
+      'display:none',
+    ].join(';');
+    parent.appendChild(this.bannerEl);
   }
 
   public update(world: WorldState): void {
@@ -145,5 +185,22 @@ export class SuitHud {
       `<span>MASS: ${massKg.toFixed(0)} kg</span>` +
       `<span>SCRAP: ${world.scrap}</span>` +
       `</div>`;
+
+    const lockTag = world.lockOn ? `LOCK: ${world.lockOn.kind.toUpperCase()}` : 'LOCK: NONE';
+    this.objectiveEl.innerHTML =
+      `<div style="color:${world.podsRemaining === 0 ? '#5ef2d6' : '#ff4d79'};font-weight:bold">` +
+      `BROOD PODS: ${world.podsTotal - world.podsRemaining} / ${world.podsTotal}` +
+      `</div>` +
+      `<div style="font-size:11px;color:#9db2cc">${lockTag} | SEED #${world.runSeed}</div>`;
+
+    if (world.runCleared) {
+      this.bannerEl.style.display = 'block';
+      this.bannerEl.innerHTML =
+        `<div style="font-size:18px;font-weight:bold;color:#5ef2d6;margin-bottom:4px">CARGO HOLD CLEARED</div>` +
+        `<div>Time: <strong>${world.clearTimeS.toFixed(1)}s</strong> | Pods: <strong>${world.kills}</strong> | Scrap: <strong>${world.scrap}</strong></div>` +
+        `<div style="margin-top:6px;color:#ffd166;font-size:12px">Press <strong>F</strong> for New Seed Run</div>`;
+    } else {
+      this.bannerEl.style.display = 'none';
+    }
   }
 }

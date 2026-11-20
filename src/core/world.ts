@@ -1,4 +1,7 @@
 import {
+  CRATE_DRY_MASS_KG,
+  CRATE_MAX_HP,
+  CRATE_SIZE_M,
   GRAV_CRUSH_S,
   GRAV_INVERT_S,
   GRAVITY_MODE,
@@ -10,6 +13,11 @@ import {
   PLAYER_AABB_W,
   PLAYER_DRY_MASS_KG,
   PLAYER_MAX_HP,
+  POD_D_M,
+  POD_DRY_MASS_KG,
+  POD_H_M,
+  POD_MAX_HP,
+  POD_W_M,
   TEMP_BYTE,
   gravCooldownS,
   tankBaffledChamberCapL,
@@ -54,11 +62,12 @@ export interface Entity {
   impactIFrames: number;
   impulseTimer: number;
   reflectCooldown: number;
-  locomotion: 'humanoid' | 'skitterer' | 'floater' | 'crusher' | 'boss' | 'prop';
+  locomotion: 'humanoid' | 'skitterer' | 'floater' | 'crusher' | 'boss' | 'prop' | 'pod';
   glands: GlandState[];
   carapace: 'none' | 'thermal' | 'insulated' | 'spined';
   deathHusk: boolean;
   grounded: boolean;
+  bioCache: boolean;
 }
 
 export interface TankChamberState {
@@ -84,12 +93,23 @@ export interface GravityPulseState {
   ownPulseGraceTicks: number;
 }
 
+export interface LockOnTarget {
+  kind: 'alien' | 'crate' | 'vat' | 'fluid0g';
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  radiusM: number;
+}
+
 export interface SuitActionState {
   nozzleTapBurstShotsLeft: number;
   nozzleTapSpacingTicks: number;
   nozzleTapWaitTicks: number;
   nozzleTapCdTicks: number;
   nozzleHoseActive: boolean;
+  airBurstCdTicks: number;
+  airBurstFlashTicks: number;
   prevPrimaryHeld: boolean;
   dashCdTicks: number;
   dashDirX: number;
@@ -117,9 +137,14 @@ export interface InputFrame {
   aimX: number; // Normalized & quantized to 1/1024
   aimY: number;
   aimZ: number;
+  hasAimPoint: boolean;
+  aimPointX: number; // Quantized cursor hit on torso plane (used for nearest lock-on)
+  aimPointY: number;
+  aimPointZ: number;
   primaryHeld: boolean; // Left-Click
   siphonHeld: boolean; // Right-Click
   pressDash: boolean; // Space (edge-triggered)
+  pressInteract: boolean; // F (edge-triggered)
 }
 
 export interface ImpactTelemetry {
@@ -138,7 +163,15 @@ export interface WorldState {
   gravCdRank: number;
   has3GOverdrive: boolean;
   scrap: number;
+  kills: number;
+  podsTotal: number;
+  podsRemaining: number;
+  runCleared: boolean;
+  clearTimeS: number;
+  nextEntityId: number;
   player: Entity;
+  entities: Entity[];
+  lockOn: LockOnTarget | null;
   playerTank: PlayerTankState;
   gravityPulse: GravityPulseState;
   suit: SuitActionState;
@@ -162,9 +195,14 @@ export function createEmptyInput(): InputFrame {
     aimX: 0,
     aimY: 0,
     aimZ: 1,
+    hasAimPoint: false,
+    aimPointX: 0,
+    aimPointY: 0,
+    aimPointZ: 0,
     primaryHeld: false,
     siphonHeld: false,
     pressDash: false,
+    pressInteract: false,
   };
 }
 
@@ -201,6 +239,92 @@ export function createPlayerEntity(spawnX = 12.0, spawnY = 0.2, spawnZ = 1.0): E
     carapace: 'none',
     deathHusk: false,
     grounded: false,
+    bioCache: false,
+  };
+}
+
+export function createCrateEntity(
+  id: number,
+  x: number,
+  y: number,
+  z: number,
+  bioCache = false,
+): Entity {
+  return {
+    id,
+    kind: 'crate',
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    halfW: CRATE_SIZE_M * 0.5,
+    height: CRATE_SIZE_M,
+    halfD: CRATE_SIZE_M * 0.5,
+    upSign: 1,
+    dryMassKg: CRATE_DRY_MASS_KG,
+    hp: CRATE_MAX_HP,
+    maxHp: CRATE_MAX_HP,
+    tempByte: TEMP_BYTE.AMBIENT,
+    chargeUnits: 0,
+    burnTicks: 0,
+    wetTicks: 0,
+    stunTicks: 0,
+    stunImmunityTicks: 0,
+    dashTimer: 0,
+    dashGraceTimer: 0,
+    impactIFrames: 0,
+    impulseTimer: 0,
+    reflectCooldown: 0,
+    locomotion: 'prop',
+    glands: [],
+    carapace: 'none',
+    deathHusk: false,
+    grounded: true,
+    bioCache,
+  };
+}
+
+export function createBroodPodEntity(
+  id: number,
+  x: number,
+  y: number,
+  z: number,
+): Entity {
+  return {
+    id,
+    kind: 'alien',
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    halfW: POD_W_M * 0.5,
+    height: POD_H_M,
+    halfD: POD_D_M * 0.5,
+    upSign: 1,
+    dryMassKg: POD_DRY_MASS_KG,
+    hp: POD_MAX_HP,
+    maxHp: POD_MAX_HP,
+    tempByte: TEMP_BYTE.AMBIENT,
+    chargeUnits: 0,
+    burnTicks: 0,
+    wetTicks: 0,
+    stunTicks: 0,
+    stunImmunityTicks: 0,
+    dashTimer: 0,
+    dashGraceTimer: 0,
+    impactIFrames: 0,
+    impulseTimer: 0,
+    reflectCooldown: 0,
+    locomotion: 'pod',
+    glands: [],
+    carapace: 'none',
+    deathHusk: false,
+    grounded: true,
+    bioCache: false,
   };
 }
 
@@ -236,6 +360,8 @@ export function createSuitActionState(): SuitActionState {
     nozzleTapWaitTicks: 0,
     nozzleTapCdTicks: 0,
     nozzleHoseActive: false,
+    airBurstCdTicks: 0,
+    airBurstFlashTicks: 0,
     prevPrimaryHeld: false,
     dashCdTicks: 0,
     dashDirX: 0,
@@ -264,7 +390,15 @@ export function createWorldState(runSeed: number): WorldState {
     gravCdRank: 0,
     has3GOverdrive: false,
     scrap: 0,
+    kills: 0,
+    podsTotal: 0,
+    podsRemaining: 0,
+    runCleared: false,
+    clearTimeS: 0,
+    nextEntityId: 1,
     player: createPlayerEntity(12.0, 0.2, 1.0),
+    entities: [],
+    lockOn: null,
     playerTank: createStarterTank(0),
     gravityPulse: {
       activePulse: 'none',
@@ -421,5 +555,9 @@ export function stepSuitGravityState(world: WorldState, input: InputFrame): void
       world.zeroGLoftTicksLeft = 0;
     }
   }
-  world.player.upSign = world.room.gravityMode === GRAVITY_MODE.GN1 ? -1 : 1;
+  const targetUp: 1 | -1 = world.room.gravityMode === GRAVITY_MODE.GN1 ? -1 : 1;
+  world.player.upSign = targetUp;
+  for (let i = 0; i < world.entities.length; i++) {
+    world.entities[i].upSign = targetUp;
+  }
 }

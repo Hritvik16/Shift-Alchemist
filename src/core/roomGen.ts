@@ -6,6 +6,7 @@ import {
   CARGO_CATWALK_Y_MIN,
   CARGO_DECK_TOP_Y,
   CARGO_HOLD_DIMS,
+  CARGO_POD_COUNT,
   DOOR_WIDTH_VOXELS,
   DOOR_Y_MAX,
   DOOR_Y_MIN,
@@ -27,6 +28,7 @@ import {
   resetRoomRuntimeTransient,
   type RoomState,
 } from './types.ts';
+import { createBroodPodEntity, createCrateEntity, type WorldState } from './world.ts';
 
 function setInitCell(
   room: RoomState,
@@ -239,4 +241,71 @@ export function generateCargoHold(room: RoomState, roomSeed: number): void {
 
   recountChunkFluids(room);
   recomputeRoomLedgers(room);
+}
+
+// Hand-authored Cargo Hold anchors (>= 1 m clear of vats, pillars, stairs, barriers)
+const CARGO_POD_ANCHORS: readonly [number, number, number][] = [
+  [5.2, 1.2, 7.6],     // West deck near WATER vat 0
+  [18.8, 1.2, 5.2],    // North-East deck
+  [12.0, 0.2, 12.0],   // Sunken pit center
+  [18.6, 1.2, 15.2],   // East deck near OIL vat 2
+  [6.0, 1.2, 20.4],    // South-West deck near CRYO vat 3
+  [11.6, 3.8, 16.0],   // South STEEL_GRATE catwalk
+  [16.0, 3.8, 11.4],   // East STEEL_GRATE catwalk
+  [14.2, 1.2, 20.6],   // South-Central deck
+  [21.2, 1.2, 11.4],   // Far-East deck
+  [2.8, 1.2, 13.0],    // Far-West deck
+];
+
+const CARGO_CRATE_ANCHORS: readonly [number, number, number][] = [
+  [10.8, 1.2, 4.8],    // North-Central deck (easy first punt)
+  [15.4, 1.2, 4.6],    // North-East approach
+  [6.2, 1.2, 18.2],    // South-West near CRYO vat
+  [17.6, 1.2, 17.8],   // South-East near OIL vat
+  [10.2, 0.2, 10.6],   // Inside sunken pit (buoyancy test)
+  [8.4, 3.8, 16.0],    // On elevated STEEL_GRATE catwalk
+  [19.2, 1.2, 8.2],    // East mid-deck
+  [13.4, 1.2, 19.6],   // South deck
+];
+
+function deterministicShuffleIndices(count: number, seed: number, salt: number): number[] {
+  const arr: number[] = [];
+  for (let i = 0; i < count; i++) arr.push(i);
+  for (let i = count - 1; i > 0; i--) {
+    const j = hash32(seed, salt, i) % (i + 1);
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr;
+}
+
+/**
+ * Seeds 6 Brood Pods and 6 movable WOOD_CRATEs (including 1 Bio-Cache) onto
+ * hand-authored Cargo Hold anchors deterministically from roomSeed (§9, §10.0).
+ */
+export function populateCargoHoldEntities(world: WorldState): void {
+  world.entities.length = 0;
+  world.nextEntityId = 1;
+  world.lockOn = null;
+  world.kills = 0;
+  world.runCleared = false;
+  world.clearTimeS = 0;
+
+  const seed = world.room.roomSeed;
+  const podOrder = deterministicShuffleIndices(CARGO_POD_ANCHORS.length, seed, 701);
+  const podCount = Math.min(CARGO_POD_COUNT, CARGO_POD_ANCHORS.length);
+  for (let i = 0; i < podCount; i++) {
+    const [x, y, z] = CARGO_POD_ANCHORS[podOrder[i]];
+    world.entities.push(createBroodPodEntity(world.nextEntityId++, x, y, z));
+  }
+  world.podsTotal = podCount;
+  world.podsRemaining = podCount;
+
+  const crateOrder = deterministicShuffleIndices(CARGO_CRATE_ANCHORS.length, seed, 709);
+  const crateCount = 6;
+  for (let i = 0; i < crateCount; i++) {
+    const [x, y, z] = CARGO_CRATE_ANCHORS[crateOrder[i]];
+    world.entities.push(createCrateEntity(world.nextEntityId++, x, y, z, i === 0));
+  }
 }

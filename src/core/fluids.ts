@@ -843,15 +843,30 @@ export function stepBallisticsStage3(world: WorldState): void {
       const sampleY = oy + rdy * t * VOXEL_SIZE_M;
       const sampleZ = oz + rdz * t * VOXEL_SIZE_M;
 
-      // Precedence 1: Entity hit (skip player if firedByPlayer in first 4 ticks)
+      // Precedence 1: Entity hit (player + crates/aliens)
+      let hitEntity: Entity | null = null;
       const skipPlayer = (flags & BALLISTIC_FLAG.FIRED_BY_PLAYER) !== 0 && bp.flightTicks[i] <= 4;
       if (!skipPlayer && pointInsideEntity(player, sampleX, sampleY, sampleZ)) {
+        hitEntity = player;
+      } else {
+        for (let ei = 0; ei < world.entities.length; ei++) {
+          const cand = world.entities[ei];
+          if (cand.hp <= 0 || cand.deathHusk) continue;
+          if (pointInsideEntity(cand, sampleX, sampleY, sampleZ)) {
+            hitEntity = cand;
+            break;
+          }
+        }
+      }
+      if (hitEntity !== null) {
         const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
         if (speed > 1e-4) {
-          const dv = (MATERIAL_SPEC[curMat].densityKgPerL * speed) / playerMass;
-          player.vx += (vx / speed) * dv;
-          player.vy += (vy / speed) * dv;
-          player.vz += (vz / speed) * dv;
+          const mass = hitEntity === player ? playerMass : getEffectiveMassKg(hitEntity);
+          const dv = (MATERIAL_SPEC[curMat].densityKgPerL * speed) / Math.max(1, mass);
+          hitEntity.vx += (vx / speed) * dv;
+          hitEntity.vy += (vy / speed) * dv;
+          hitEntity.vz += (vz / speed) * dv;
+          if (hitEntity !== player && dv > 0.2) hitEntity.impulseTimer = 36;
         }
         const tx = hasLastAir ? lastAirX : gx;
         const ty = hasLastAir ? lastAirY : gy;

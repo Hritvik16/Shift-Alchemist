@@ -174,6 +174,24 @@ export const AIR_BURST_DMG = 5;
 export const AIR_BURST_DELTAV_MIN = 2.5;
 export const AIR_BURST_DELTAV_MAX = 14.0;
 export const AIR_BURST_RAYS = 25;
+export const AIR_BURST_CD_TICKS = 15; // 0.25 s @ 60 Hz
+export const AIR_BURST_CONE_COS = 0.9063077870366499; // cos(25 deg), deterministic constant
+export const AIR_BURST_CONE_COS_SQ = AIR_BURST_CONE_COS * AIR_BURST_CONE_COS;
+export const AIR_BURST_RECOIL_0G = 2.5;
+export const AIR_BURST_TIER1_DMG = 4;
+export const AIR_BURST_TIER2_DMG = 2;
+
+// Dynamic Crates & Brood Pods (M1.3-lite / §8.2, §10.0)
+export const CRATE_DRY_MASS_KG = 60;
+export const CRATE_MAX_HP = 60;
+export const CRATE_SIZE_M = 1.0;
+export const POD_DRY_MASS_KG = 80;
+export const POD_MAX_HP = 100;
+export const POD_W_M = 0.9;
+export const POD_H_M = 1.2;
+export const POD_D_M = 0.9;
+export const CARGO_POD_COUNT = 6;
+export const ENTITY_RESTITUTION = 0.4;
 
 export function siphonRateLps(rank: number): number {
   return 120 + 60 * rank;

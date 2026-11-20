@@ -10,7 +10,7 @@ import {
   byteToTempC,
 } from './core/balance.ts';
 import { computePlumbLine, stepWorldTick } from './core/physics.ts';
-import { generateCargoHold } from './core/roomGen.ts';
+import { generateCargoHold, populateCargoHoldEntities } from './core/roomGen.ts';
 import {
   applyStructuralDamage,
   carveSphereDebug,
@@ -18,12 +18,16 @@ import {
   type VoxelRayHit,
 } from './core/types.ts';
 import {
+  createPlayerEntity,
+  createStarterTank,
+  createSuitActionState,
   createWorldState,
   getActiveChamber,
   getEffectiveMassKg,
   type InputFrame,
 } from './core/world.ts';
 import { DebugOverlay } from './viewer/debugOverlay.ts';
+import { EntityRenderer } from './viewer/entityRenderer.ts';
 import { FluidRenderer } from './viewer/fluidRenderer.ts';
 import { SuitHud } from './viewer/hud.ts';
 import { PlayerRig } from './viewer/playerRig.ts';
@@ -33,34 +37,74 @@ const app = document.getElementById('app');
 if (!app) throw new Error('Missing #app mount');
 
 const urlSeed = new URLSearchParams(window.location.search).get('seed');
-const runSeed = urlSeed ? Number(urlSeed) >>> 0 : Date.now() >>> 0;
+const initialSeed = urlSeed ? Number(urlSeed) >>> 0 : Date.now() >>> 0;
 
-const world = createWorldState(runSeed);
-generateCargoHold(world.room, runSeed);
-recomputeRoomLedgers(world.room, world.playerTank);
-world.entryLedgers = { ...world.room.ledgers };
-
+const world = createWorldState(initialSeed);
 const scene3D = new Scene3D(app);
 const fluidRenderer = new FluidRenderer(scene3D.scene);
+const entityRenderer = new EntityRenderer(scene3D.scene);
 const playerRig = new PlayerRig(scene3D.scene);
 const hud = new SuitHud(app);
 const overlay = new DebugOverlay(app);
 
-scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
-let remainingMesh = 1;
-while (remainingMesh > 0) {
-  remainingMesh = scene3D.processDirtyMeshes(world.room, 900, 100);
+function startNewRun(seed: number): void {
+  const s = seed >>> 0;
+  world.runSeed = s;
+  world.simTick = 0;
+  world.tankCapRank = 0;
+  world.siphonRank = 0;
+  world.nozzlePressureRank = 0;
+  world.gravCdRank = 0;
+  world.has3GOverdrive = false;
+  world.scrap = 0;
+  world.player = createPlayerEntity(12.0, 0.2, 1.0);
+  world.playerTank = createStarterTank(0);
+  world.suit = createSuitActionState();
+  world.gravityPulse = {
+    activePulse: 'none',
+    pulseTicksLeft: 0,
+    cooldownTicks: 0,
+    ownPulseExempt: false,
+    ownPulseGraceTicks: 0,
+  };
+  world.impactTelemetry = {
+    lastImpactSpeed: 0,
+    lastWallSplatDmg: 0,
+    lastImpactExempt: false,
+    lastImpactTick: -1,
+  };
+  world.zeroGLoftTicksLeft = 0;
+  world.zeroGLoftDirY = 1;
+  world.gravityChangedThisTick = false;
+
+  generateCargoHold(world.room, s);
+  populateCargoHoldEntities(world);
+  recomputeRoomLedgers(world.room, world.playerTank);
+  world.entryLedgers = { ...world.room.ledgers };
+
+  scene3D.resetRoomVisuals();
+  fluidRenderer.resetAll();
+  entityRenderer.reset();
+  scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
+
+  let remainingMesh = 1;
+  while (remainingMesh > 0) {
+    remainingMesh = scene3D.processDirtyMeshes(world.room, 900, 100);
+  }
+  let remainingFluid = 1;
+  while (remainingFluid > 0) {
+    remainingFluid = fluidRenderer.update(world.room, scene3D.focusPos, 0, 900, 100);
+  }
 }
-let remainingFluid = 1;
-while (remainingFluid > 0) {
-  remainingFluid = fluidRenderer.update(world.room, scene3D.focusPos, 0, 900, 100);
-}
+
+startNewRun(initialSeed);
 
 const keys = new Set<string>();
 let queuedQ = false;
 let queuedC = false;
 let queuedV = false;
 let queuedDash = false;
+let queuedInteract = false;
 let primaryHeld = false;
 let siphonHeld = false;
 let pointerX = window.innerWidth * 0.5;
@@ -117,6 +161,7 @@ window.addEventListener('keydown', (e) => {
     else if (e.code === 'KeyC') queuedC = true;
     else if (e.code === 'KeyV') queuedV = true;
     else if (e.code === 'Space') queuedDash = true;
+    else if (e.code === 'KeyF') queuedInteract = true;
   }
   keys.add(e.code);
 
@@ -154,7 +199,7 @@ function sampleInput(): InputFrame {
     moveX += 1;
     moveZ -= 1;
   }
-  const [aimX, aimY, aimZ] = scene3D.computeTorsoAimDirection(
+  const aim = scene3D.computeTorsoAim(
     world.player.x,
     world.player.y,
     world.player.z,
@@ -169,17 +214,23 @@ function sampleInput(): InputFrame {
     pressQ: queuedQ,
     pressC: queuedC,
     pressV: queuedV,
-    aimX,
-    aimY,
-    aimZ,
+    aimX: aim.aimX,
+    aimY: aim.aimY,
+    aimZ: aim.aimZ,
+    hasAimPoint: aim.hasAimPoint,
+    aimPointX: aim.aimPointX,
+    aimPointY: aim.aimPointY,
+    aimPointZ: aim.aimPointZ,
     primaryHeld,
     siphonHeld,
     pressDash: queuedDash,
+    pressInteract: queuedInteract,
   };
   queuedQ = false;
   queuedC = false;
   queuedV = false;
   queuedDash = false;
+  queuedInteract = false;
   return frame;
 }
 
@@ -212,13 +263,25 @@ function tick(now: number): void {
   const simStart = performance.now();
   let ticksThisFrame = 0;
   while (accumulator >= FIXED_DT && ticksThisFrame < 3) {
-    stepWorldTick(world, sampleInput());
+    const inp = sampleInput();
+    if (inp.pressInteract && world.runCleared) {
+      startNewRun((world.runSeed + 1) >>> 0);
+      accumulator = 0;
+      break;
+    }
+    stepWorldTick(world, inp);
+    if (world.player.hp <= 0) {
+      startNewRun(Date.now() >>> 0);
+      accumulator = 0;
+      break;
+    }
     accumulator -= FIXED_DT;
     ticksThisFrame++;
   }
   const simMs = performance.now() - simStart;
 
   const renderStart = performance.now();
+  const timeSec = now * 0.001;
   const plumb = computePlumbLine(world.room, world.player);
   playerRig.update(
     world.player,
@@ -227,11 +290,12 @@ function tick(now: number): void {
     world.room.gravityMode,
     plumb,
     clampedDt,
-    now * 0.001,
+    timeSec,
   );
 
   scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
   scene3D.updateCamera();
+  entityRenderer.update(world, scene3D.camera, timeSec);
   lastHit = scene3D.pickVoxel(world.room, pointerX, pointerY);
 
   const remeshCap = adaptiveFallback ? MAX_REMESHES_FALLBACK : MAX_REMESHES_PER_FRAME;
@@ -244,7 +308,7 @@ function tick(now: number): void {
   const dirtyFluidQueue = fluidRenderer.update(
     world.room,
     scene3D.focusPos,
-    now * 0.001,
+    timeSec,
     fluidRebuildCap,
     0,
   );
@@ -281,7 +345,10 @@ function tick(now: number): void {
     const tankSummary =
       ch.liters > 0 && ch.mat !== MAT.AIR
         ? `${MATERIAL_SPEC[ch.mat].name} ${ch.liters}/${ch.capL}L (${byteToTempC(ch.tempByte)}C)`
-        : `EMPTY 0/${ch.capL}L`;
+        : `EMPTY 0/${ch.capL}L (Air Burst)`;
+    const lockOnInfo = world.lockOn
+      ? `${world.lockOn.kind}#${world.lockOn.id}`
+      : 'none';
 
     overlay.update({
       fps: 1000 / Math.max(0.001, avgMs),
@@ -310,6 +377,9 @@ function tick(now: number): void {
       playerMassKg: getEffectiveMassKg(world.player, world.playerTank),
       tankSummary,
       siphonActive: world.suit.siphonActive,
+      lockOnInfo,
+      podsInfo: `${world.podsTotal - world.podsRemaining}/${world.podsTotal}`,
+      entityCount: 1 + world.entities.length,
       upSign: world.player.upSign,
       grounded: world.player.grounded,
       gravityMode: world.room.gravityMode,

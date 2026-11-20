@@ -28,6 +28,7 @@ import {
   siphonRateLPerTick,
   type MaterialId,
 } from './balance.ts';
+import { fireCompressedAirBurst, updateMagneticLockOn } from './combat.ts';
 import { spawnBallistic } from './fluids.ts';
 import { hash32 } from './hash.ts';
 import {
@@ -443,7 +444,21 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
   const chamber = getActiveChamber(world.playerTank);
 
   if (suit.nozzleTapCdTicks > 0) suit.nozzleTapCdTicks--;
+  if (suit.airBurstCdTicks > 0) suit.airBurstCdTicks--;
+  if (suit.airBurstFlashTicks > 0) suit.airBurstFlashTicks--;
   if (!input.primaryHeld) suit.nozzleHoseActive = false;
+
+  if (
+    chamber.liters <= 0 &&
+    !chamber.lockedSpill &&
+    suit.nozzleTapBurstShotsLeft === 0 &&
+    input.primaryHeld &&
+    suit.airBurstCdTicks === 0
+  ) {
+    fireCompressedAirBurst(world);
+    suit.prevPrimaryHeld = input.primaryHeld;
+    return;
+  }
 
   const risingEdge = input.primaryHeld && !suit.prevPrimaryHeld;
 
@@ -710,6 +725,8 @@ export function stepSuitActionsStage1(world: WorldState, input: InputFrame): voi
     suit.aimDirY = input.aimY / len;
     suit.aimDirZ = input.aimZ / len;
   }
+
+  updateMagneticLockOn(world, input);
 
   stepAtomicSiphon(world, input);
   stepTankChargeDecay(world);

@@ -1,15 +1,28 @@
 import {
   ARENA_W,
+  BACKFIRE_IMPULSE_NOM,
+  BACKFIRE_SELF_DMG,
   DASH_CD_TICKS,
   DASH_DURATION_TICKS,
   DASH_EXHAUST_SPEED_M_S,
   DASH_SPEED_M_S,
+  FIXED_DT,
   GRAVITY_MODE,
   MAT,
   MAX_ACTIVE_BALLISTIC,
+  MAX_DEFERRED_FLUID,
   NOZZLE_CLUSTER_RADIUS_M,
   NOZZLE_HOLD_RECOIL_0G,
   NOZZLE_HOLD_SPEED_M_S,
+  NOZZLE_LOBBER_CD_TICKS,
+  NOZZLE_LOBBER_RECOIL_0G,
+  NOZZLE_LOBBER_SHOT_L,
+  NOZZLE_LOBBER_SPEED_M_S,
+  NOZZLE_MODE,
+  NOZZLE_SCATTER_CD_TICKS,
+  NOZZLE_SCATTER_RECOIL_0G,
+  NOZZLE_SCATTER_SHOT_L,
+  NOZZLE_SCATTER_SPEED_M_S,
   NOZZLE_TAP_BURST_L,
   NOZZLE_TAP_CD_TICKS,
   NOZZLE_TAP_RECOIL_0G,
@@ -28,8 +41,9 @@ import {
   siphonRateLPerTick,
   type MaterialId,
 } from './balance.ts';
-import { fireCompressedAirBurst, updateMagneticLockOn } from './combat.ts';
-import { spawnBallistic } from './fluids.ts';
+import { fireCompressedAirBurst, hasAirBurstLOS, updateMagneticLockOn } from './combat.ts';
+import { WORKBENCH_INTERACT_RANGE_M, purchaseWorkbenchTerminal } from './workbench.ts';
+import { placeOrDeferFluid, spawnBallistic } from './fluids.ts';
 import { hash32 } from './hash.ts';
 import {
   BALLISTIC_FLAG,
@@ -41,11 +55,14 @@ import {
   inRoomBounds,
   isSolidMat,
   packVoxel,
+  pushCombatEvent,
   writeCell,
+  type DoorRecord,
   type RoomState,
 } from './types.ts';
 import {
   getActiveChamber,
+  getEffectiveMassKg,
   getFeetY,
   type InputFrame,
   type TankChamberState,
@@ -211,6 +228,150 @@ function emptyChamberIfZero(chamber: TankChamberState): void {
   }
 }
 
+function hasAtomicSpillCapacity(room: RoomState, liters: number): boolean {
+  const freeBall = MAX_ACTIVE_BALLISTIC - room.ballistic.count;
+  const freeDef = MAX_DEFERRED_FLUID - room.deferredFluid.count;
+  return freeBall + freeDef >= liters;
+}
+
+/**
+ * Drains a chamber around feetY through placeOrDeferFluid() without deleting any liter (§3.2, §8.2).
+ * Spilled superheated OIL (>= +180 C) ignites in AIR and increments oilCombusted.
+ */
+function drainChamberAroundFeet(world: WorldState, chamber: TankChamberState): boolean {
+  const room = world.room;
+  const p = world.player;
+  const tx = Math.floor(p.x / VOXEL_SIZE_M);
+  const ty = Math.floor((getFeetY(p) + 0.1 * p.upSign) / VOXEL_SIZE_M);
+  const tz = Math.floor(p.z / VOXEL_SIZE_M);
+
+  while (chamber.liters > 0) {
+    const igniteOil = chamber.mat === MAT.OIL && chamber.tempByte >= TEMP_BYTE.OIL_IGNITE;
+    const placeMat = igniteOil ? MAT.FIRE : chamber.mat;
+    const placeTemp = igniteOil ? TEMP_BYTE.FIRE : chamber.tempByte;
+    const placeCharge = igniteOil ? 0 : chamber.chargeUnits;
+    const ok = placeOrDeferFluid(
+      room,
+      placeMat,
+      placeTemp,
+      placeCharge,
+      tx,
+      ty,
+      tz,
+      true,
+      p,
+      world.simTick,
+    );
+    if (!ok) {
+      chamber.lockedSpill = true;
+      return false;
+    }
+    if (igniteOil) room.ledgers.oilCombusted++;
+    chamber.liters--;
+  }
+  emptyChamberIfZero(chamber);
+  return true;
+}
+
+/**
+ * Tank Backfire (§8.2): 25 self-dmg (never reduced by Hazard Lining), mass-scaled 720 kg*m/s
+ * impulse (deltaV in [2.5, 9.0]), and grid-conserved spill around feetY (locking chamber if saturated).
+ */
+function triggerTankBackfire(world: WorldState, chamber: TankChamberState, reasonLabel: string): void {
+  const p = world.player;
+  const room = world.room;
+  p.hp = Math.max(0, p.hp - BACKFIRE_SELF_DMG);
+
+  const massKg = getEffectiveMassKg(p, world.playerTank);
+  const dv = Math.max(2.5, Math.min(9.0, BACKFIRE_IMPULSE_NOM / Math.max(1, massKg)));
+  const h = hash32(room.roomSeed, world.simTick, 8191);
+  const rx = ((h & 255) / 127.5) - 1;
+  const rz = (((h >>> 8) & 255) / 127.5) - 1;
+  const rLen = Math.hypot(rx, rz);
+  const dx = rLen > 1e-3 ? rx / rLen : -world.suit.aimDirX;
+  const dz = rLen > 1e-3 ? rz / rLen : -world.suit.aimDirZ;
+  p.vx += dx * dv;
+  p.vy += 3.0 * p.upSign;
+  p.vz += dz * dv;
+  p.grounded = false;
+  p.impulseTimer = 36;
+
+  pushCombatEvent(room, {
+    kind: 'splat',
+    entityId: p.id,
+    x: p.x,
+    y: p.y + p.height + 0.2,
+    z: p.z,
+    value: BACKFIRE_SELF_DMG,
+    colorHex: 0xff595e,
+    label: `${reasonLabel} -${BACKFIRE_SELF_DMG}`,
+  });
+
+  drainChamberAroundFeet(world, chamber);
+}
+
+function isCryoThermalShockMix(
+  existingMat: MaterialId,
+  existingTemp: number,
+  incomingMat: MaterialId,
+  incomingTemp: number,
+): boolean {
+  if (existingMat === MAT.CRYO && incomingMat !== MAT.CRYO && incomingTemp >= TEMP_BYTE.BOIL) {
+    return true;
+  }
+  if (incomingMat === MAT.CRYO && existingMat !== MAT.CRYO && existingTemp >= TEMP_BYTE.BOIL) {
+    return true;
+  }
+  return false;
+}
+
+function isTemperatureBackfire(
+  baffled: boolean,
+  mat: MaterialId,
+  tempByte: number,
+): boolean {
+  if (baffled) {
+    return tempByte > TEMP_BYTE.BAFFLED_SAFE_MAX; // > +240 C (byte >= 111)
+  }
+  if (mat === MAT.WATER && tempByte >= TEMP_BYTE.BOIL) return true; // >= +100 C
+  if (mat === MAT.OIL && tempByte >= TEMP_BYTE.OIL_IGNITE) return true; // >= +180 C
+  return false;
+}
+
+function packFiredQuantumWithAttachments(
+  world: WorldState,
+  mat: MaterialId,
+  tempByte: number,
+  chargeUnits: number,
+  shimmer: number,
+  isFinalOilLiter: boolean,
+): { packed: number; flags: number } {
+  let outTemp = tempByte;
+  let outCharge = chargeUnits;
+  let flags: number = BALLISTIC_FLAG.FIRED_BY_PLAYER;
+
+  // Spark-Plug Igniter (§9): superheats final 1 L of OIL dash/burst/stream -> auto-ignites at tick 2
+  if (world.hasSparkPlug && isFinalOilLiter && mat === MAT.OIL) {
+    outTemp = Math.max(outTemp, TEMP_BYTE.OIL_IGNITE);
+    flags |= BALLISTIC_FLAG.IGNITE_IN_FLIGHT;
+  }
+
+  // Piezo-Arc Coil (§9): charges fired/dashed WATER to +120 V (60 units)
+  if (world.hasPiezoArc && mat === MAT.WATER) {
+    outCharge = 60;
+  }
+
+  // Cryo-Expansion Nozzle (§9): chills fired/dashed WATER to 0 C (byte 50) -> freezes to ICE on impact
+  if (world.hasCryoNozzle && mat === MAT.WATER) {
+    outTemp = TEMP_BYTE.FREEZE;
+  }
+
+  return {
+    packed: packVoxel(mat, outTemp, outCharge, 0, shimmer, 0, 0),
+    flags,
+  };
+}
+
 /**
  * Step 1a: Atomic Vacuum Siphon (6.0 m, 35 deg LOS cone, 2 + siphonRank L/tick).
  * Nearest-first by (distSq, idx), single material per tick, cap & source guarded (§3.2, §6.2).
@@ -240,6 +401,55 @@ function stepAtomicSiphon(world: WorldState, input: InputFrame): void {
   const ax = suit.aimDirX;
   const ay = suit.aimDirY;
   const az = suit.aimDirZ;
+
+  // Bio-Siphoning from stunned or <50% HP aliens in the 6.0 m, 35 deg LOS cone (§3.2, §8.3)
+  let bestAlienIdx = -1;
+  let bestAlienDistSq = SIPHON_RANGE_M * SIPHON_RANGE_M;
+  for (let i = 0; i < world.entities.length; i++) {
+    const e = world.entities[i];
+    if (e.kind !== 'alien' || e.hp <= 0 || e.deathHusk || e.glands.length === 0) continue;
+    const eligible = e.stunTicks > 0 || e.hp < e.maxHp * 0.5;
+    if (!eligible) continue;
+    const gl = e.glands[0];
+    if (gl.liters <= 0 || !isSiphonableGridMat(gl.mat)) continue;
+    if (chamber.liters > 0 && chamber.mat !== gl.mat) continue;
+    const tx = e.x;
+    const ty = e.y + e.height * 0.5;
+    const tz = e.z;
+    const dx = tx - oxM;
+    const dy = ty - oyM;
+    const dz = tz - ozM;
+    const dSq = dx * dx + dy * dy + dz * dz;
+    if (dSq > bestAlienDistSq) continue;
+    if (dSq > 1e-4) {
+      const dot = dx * ax + dy * ay + dz * az;
+      if (dot <= 0 || dot * dot < dSq * SIPHON_CONE_COS_SQ) continue;
+    }
+    if (!hasAirBurstLOS(room, oxM, oyM, ozM, tx, ty, tz)) continue;
+    bestAlienDistSq = dSq;
+    bestAlienIdx = i;
+  }
+  if (bestAlienIdx >= 0) {
+    const alien = world.entities[bestAlienIdx];
+    const gl = alien.glands[0];
+    const take = Math.min(maxTake, gl.liters);
+    if (take > 0) {
+      const totalTemp = chamber.liters * chamber.tempByte + take * gl.tempByte;
+      const newLiters = chamber.liters + take;
+      gl.liters -= take;
+      chamber.mat = gl.mat;
+      chamber.liters = newLiters;
+      chamber.tempByte = Math.round(totalTemp / newLiters);
+      chamber.chargeUnits = Math.max(chamber.liters > take ? chamber.chargeUnits : 0, gl.chargeUnits);
+      suit.siphonActive = true;
+      suit.siphonMat = gl.mat;
+      suit.siphonLitersThisTick = take;
+      suit.siphonTargetX = alien.x;
+      suit.siphonTargetY = alien.y + alien.height * 0.5;
+      suit.siphonTargetZ = alien.z;
+      return;
+    }
+  }
 
   // Tight voxel AABB bounded by the 6.0 m sphere around torso
   const minVX = Math.max(1, Math.floor(oxV - SIPHON_RANGE_V));
@@ -360,9 +570,27 @@ function stepAtomicSiphon(world: WorldState, input: InputFrame): void {
 
       if (chosenMat === MAT.AIR) {
         chosenMat = mat;
-        // M3.1 single-material guard (M3.2 adds expanding-BFS displacement & backfire here)
+        // M3.2 Atomic Tank Compatibility, Backfire & Displacement Spill (§3.1, §3.2, §8.2)
         if (chamber.liters > 0 && chamber.mat !== chosenMat) {
-          return;
+          const inTemp = getTempByte(val);
+          const inCharge = getTimerOrCharge(val);
+          if (isCryoThermalShockMix(chamber.mat, chamber.tempByte, chosenMat, inTemp)) {
+            triggerTankBackfire(world, chamber, 'CRYO SHOCK BACKFIRE!');
+            return;
+          }
+          if (!world.playerTank.baffled && chosenMat === MAT.WATER && inCharge > 0) {
+            triggerTankBackfire(world, chamber, 'VOLTAIC ARC BACKFIRE!');
+            return;
+          }
+          // Non-hazardous incompatible siphon: atomic capacity check before displacing old chamber
+          if (!hasAtomicSpillCapacity(room, chamber.liters)) {
+            return;
+          }
+          if (!drainChamberAroundFeet(world, chamber)) {
+            return;
+          }
+          totalTemp = 0;
+          maxCharge = 0;
         }
         suit.siphonTargetX = (vx + 0.5) * VOXEL_SIZE_M;
         suit.siphonTargetY = (vy + 0.5) * VOXEL_SIZE_M;
@@ -381,13 +609,17 @@ function stepAtomicSiphon(world: WorldState, input: InputFrame): void {
 
   if (extracted > 0) {
     const newLiters = chamber.liters + extracted;
+    const avgTemp = Math.round(totalTemp / newLiters);
     chamber.mat = chosenMat;
     chamber.liters = newLiters;
-    chamber.tempByte = Math.round(totalTemp / newLiters);
+    chamber.tempByte = avgTemp;
     chamber.chargeUnits = maxCharge;
     suit.siphonActive = true;
     suit.siphonMat = chosenMat;
     suit.siphonLitersThisTick = extracted;
+    if (isTemperatureBackfire(world.playerTank.baffled, chosenMat, avgTemp)) {
+      triggerTankBackfire(world, chamber, 'THERMAL BACKFIRE!');
+    }
   }
 }
 
@@ -395,9 +627,14 @@ function stepAtomicSiphon(world: WorldState, input: InputFrame): void {
  * Step 1b: Tank chamber electrical charge decay (-2 units/tick, §3.1).
  */
 function stepTankChargeDecay(world: WorldState): void {
+  if (world.suit.piezoArcCdTicks > 0) world.suit.piezoArcCdTicks--;
+  if (world.suit.streamShockCdTicks > 0) world.suit.streamShockCdTicks--;
   const count = world.playerTank.baffled ? 2 : 1;
   for (let i = 0; i < count; i++) {
     const c = world.playerTank.chambers[i];
+    if (c.lockedSpill && c.liters > 0) {
+      drainChamberAroundFeet(world, c);
+    }
     if (c.chargeUnits > 0) {
       c.chargeUnits = Math.max(0, c.chargeUnits - 2);
     }
@@ -461,6 +698,136 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
   }
 
   const risingEdge = input.primaryHeld && !suit.prevPrimaryHeld;
+
+  if (
+    suit.nozzleMode !== NOZZLE_MODE.STREAM &&
+    chamber.liters > 0 &&
+    !chamber.lockedSpill &&
+    input.primaryHeld &&
+    suit.nozzleTapCdTicks === 0
+  ) {
+    const oxM = p.x;
+    const oyM = p.y + PLAYER_TORSO_OFFSET_M;
+    const ozM = p.z;
+    const ax = suit.aimDirX;
+    const ay = suit.aimDirY;
+    const az = suit.aimDirZ;
+    const speedMult = nozzlePressureMult(world.nozzlePressureRank);
+    const [rx, ry, rz, ux, uy, uz] = buildPerpBasis(ax, ay, az);
+    const [mx, my, mz] = resolveSafeSpawnPoint(
+      room,
+      oxM,
+      oyM,
+      ozM,
+      oxM + ax * 0.45,
+      oyM + ay * 0.45,
+      ozM + az * 0.45,
+    );
+
+    if (suit.nozzleMode === NOZZLE_MODE.SCATTER) {
+      const wanted = Math.min(NOZZLE_SCATTER_SHOT_L, chamber.liters);
+      if (MAX_ACTIVE_BALLISTIC - room.ballistic.count >= wanted) {
+        const speed = NOZZLE_SCATTER_SPEED_M_S * speedMult;
+        let spawned = 0;
+        for (let k = 0; k < wanted; k++) {
+          const fan = ((k / Math.max(1, wanted - 1)) - 0.5) * 0.54; // ~30 deg horizontal fan
+          const vOff = ((k % 3) - 1) * 0.06;
+          let dx = ax + rx * fan + ux * vOff;
+          let dy = ay + ry * fan + uy * vOff + 0.05;
+          let dz = az + rz * fan + uz * vOff;
+          const inv = 1 / Math.max(1e-4, Math.hypot(dx, dy, dz));
+          dx *= inv;
+          dy *= inv;
+          dz *= inv;
+          const h = hash32(room.roomSeed, world.simTick, k * 41 + 13);
+          const spd = speed * (0.9 + ((h & 255) / 255) * 0.22);
+          const [sx, sy, sz] = clampToRoomInterior(room, mx, my, mz);
+          const isLastOil = k === wanted - 1;
+          const qData = packFiredQuantumWithAttachments(world, chamber.mat, chamber.tempByte, chamber.chargeUnits, (h >>> 8) & 7, isLastOil);
+          const slot = spawnBallistic(
+            room,
+            sx,
+            sy,
+            sz,
+            dx * spd,
+            dy * spd,
+            dz * spd,
+            qData.packed,
+            qData.flags,
+          );
+          if (slot !== -1) spawned++;
+        }
+        if (spawned > 0) {
+          chamber.liters -= spawned;
+          emptyChamberIfZero(chamber);
+          suit.nozzleTapCdTicks = NOZZLE_SCATTER_CD_TICKS;
+          if (room.gravityMode === GRAVITY_MODE.G0) {
+            const rec = NOZZLE_SCATTER_RECOIL_0G * (world.hasGyroStabilizer ? 0.5 : 1.0);
+            p.vx -= ax * rec;
+            p.vy -= ay * rec;
+            p.vz -= az * rec;
+          }
+        }
+      }
+      suit.prevPrimaryHeld = input.primaryHeld;
+      return;
+    }
+
+    if (suit.nozzleMode === NOZZLE_MODE.LOBBER) {
+      const wanted = Math.min(NOZZLE_LOBBER_SHOT_L, chamber.liters);
+      if (MAX_ACTIVE_BALLISTIC - room.ballistic.count >= wanted) {
+        const speed = NOZZLE_LOBBER_SPEED_M_S * speedMult;
+        // High-arc lob lift in gravity modes so the glob clears barriers
+        let ldx = ax;
+        let ldy = room.gravityMode === GRAVITY_MODE.G0 ? ay : Math.min(0.68, ay + 0.34);
+        let ldz = az;
+        const lInv = 1 / Math.max(1e-4, Math.hypot(ldx, ldy, ldz));
+        ldx *= lInv;
+        ldy *= lInv;
+        ldz *= lInv;
+
+        let spawned = 0;
+        for (let k = 0; k < wanted; k++) {
+          const h = hash32(room.roomSeed, world.simTick, k * 53 + 29);
+          const jR = (((h & 255) / 127.5) - 1) * 0.08;
+          const jU = ((((h >>> 8) & 255) / 127.5) - 1) * 0.08;
+          const [sx, sy, sz] = clampToRoomInterior(
+            room,
+            mx + rx * jR + ux * jU,
+            my + ry * jR + uy * jU,
+            mz + rz * jR + uz * jU,
+          );
+          const isLastOil = k === wanted - 1;
+          const qData = packFiredQuantumWithAttachments(world, chamber.mat, chamber.tempByte, chamber.chargeUnits, (h >>> 16) & 7, isLastOil);
+          const slot = spawnBallistic(
+            room,
+            sx,
+            sy,
+            sz,
+            (ldx + rx * jR * 0.5) * speed,
+            (ldy + uy * jU * 0.5) * speed,
+            (ldz + rz * jR * 0.5) * speed,
+            qData.packed,
+            qData.flags,
+          );
+          if (slot !== -1) spawned++;
+        }
+        if (spawned > 0) {
+          chamber.liters -= spawned;
+          emptyChamberIfZero(chamber);
+          suit.nozzleTapCdTicks = NOZZLE_LOBBER_CD_TICKS;
+          if (room.gravityMode === GRAVITY_MODE.G0) {
+            const rec = NOZZLE_LOBBER_RECOIL_0G * (world.hasGyroStabilizer ? 0.5 : 1.0);
+            p.vx -= ldx * rec;
+            p.vy -= ldy * rec;
+            p.vz -= ldz * rec;
+          }
+        }
+      }
+      suit.prevPrimaryHeld = input.primaryHeld;
+      return;
+    }
+  }
 
   if (
     risingEdge &&
@@ -544,7 +911,9 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
               blocked ? mz : candZ,
             );
             const shimmer = hash32(room.roomSeed, world.simTick, k * 31 + 7) & 7;
-            const packed = packVoxel(chamber.mat, chamber.tempByte, chamber.chargeUnits, 0, shimmer, 0, 0);
+            const isFinalOil =
+              (suit.nozzleTapBurstShotsLeft === 1 || chamber.liters <= wanted) && k === wanted - 1;
+            const qData = packFiredQuantumWithAttachments(world, chamber.mat, chamber.tempByte, chamber.chargeUnits, shimmer, isFinalOil);
             const slot = spawnBallistic(
               room,
               sx,
@@ -553,8 +922,8 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
               ax * speed,
               ay * speed,
               az * speed,
-              packed,
-              BALLISTIC_FLAG.FIRED_BY_PLAYER,
+              qData.packed,
+              qData.flags,
             );
             if (slot !== -1) spawned++;
           }
@@ -563,7 +932,7 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
             chamber.liters -= spawned;
             emptyChamberIfZero(chamber);
             if (room.gravityMode === GRAVITY_MODE.G0) {
-              const recoil = NOZZLE_TAP_RECOIL_0G * (spawned / NOZZLE_TAP_BURST_L);
+              const recoil = NOZZLE_TAP_RECOIL_0G * (spawned / NOZZLE_TAP_BURST_L) * (world.hasGyroStabilizer ? 0.5 : 1.0);
               p.vx -= ax * recoil;
               p.vy -= ay * recoil;
               p.vz -= az * recoil;
@@ -593,7 +962,8 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
       const [sx, sy, sz] = clampToRoomInterior(room, mx, my, mz);
       const speed = NOZZLE_HOLD_SPEED_M_S * speedMult;
       const shimmer = hash32(room.roomSeed, world.simTick, 911) & 7;
-      const packed = packVoxel(chamber.mat, chamber.tempByte, chamber.chargeUnits, 0, shimmer, 0, 0);
+      const isFinalOil = chamber.liters === 1;
+      const qData = packFiredQuantumWithAttachments(world, chamber.mat, chamber.tempByte, chamber.chargeUnits, shimmer, isFinalOil);
       const slot = spawnBallistic(
         room,
         sx,
@@ -602,16 +972,17 @@ function stepLoadedNozzle(world: WorldState, input: InputFrame): void {
         ax * speed,
         ay * speed,
         az * speed,
-        packed,
-        BALLISTIC_FLAG.FIRED_BY_PLAYER,
+        qData.packed,
+        qData.flags,
       );
       if (slot !== -1) {
         chamber.liters -= 1;
         emptyChamberIfZero(chamber);
         if (room.gravityMode === GRAVITY_MODE.G0) {
-          p.vx -= ax * NOZZLE_HOLD_RECOIL_0G;
-          p.vy -= ay * NOZZLE_HOLD_RECOIL_0G;
-          p.vz -= az * NOZZLE_HOLD_RECOIL_0G;
+          const hRec = NOZZLE_HOLD_RECOIL_0G * (world.hasGyroStabilizer ? 0.5 : 1.0);
+          p.vx -= ax * hRec;
+          p.vy -= ay * hRec;
+          p.vz -= az * hRec;
         }
       }
     }
@@ -672,6 +1043,8 @@ function stepJetpackDash(world: WorldState, input: InputFrame): void {
     p.dashTimer = DASH_DURATION_TICKS;
     p.dashGraceTimer = 0;
     suit.dashCdTicks = DASH_CD_TICKS;
+    suit.nozzleTapBurstShotsLeft = 0;
+    suit.nozzleHoseActive = false;
   }
 
   if (p.dashTimer > 0) {
@@ -691,17 +1064,35 @@ function stepJetpackDash(world: WorldState, input: InputFrame): void {
       );
       const [sx, sy, sz] = clampToRoomInterior(room, ex, ey, ez);
       const shimmer = hash32(room.roomSeed, world.simTick, 4099) & 7;
-      const packed = packVoxel(chamber.mat, chamber.tempByte, chamber.chargeUnits, 0, shimmer, 0, 0);
+      const isZeroG = room.gravityMode === GRAVITY_MODE.G0;
+      const isFinalDashOil = p.dashTimer <= 3 || chamber.liters <= 3;
+      // In 0G, Spark-Plug ignites the ribbon tail mid-flight; in gravity modes, pulse every 3rd tick (~0.7 m) + tail so the entire dash leaves a blazing fire trail
+      const sparkPulse1G =
+        !isZeroG &&
+        world.hasSparkPlug &&
+        chamber.mat === MAT.OIL &&
+        (isFinalDashOil || p.dashTimer % 3 === 1);
+      const qData = packFiredQuantumWithAttachments(
+        world,
+        chamber.mat,
+        sparkPulse1G ? Math.max(chamber.tempByte, 111) : chamber.tempByte,
+        chamber.chargeUnits,
+        shimmer,
+        isZeroG && isFinalDashOil,
+      );
+      const exSpd = isZeroG ? DASH_EXHAUST_SPEED_M_S : 0;
+      const exVy = isZeroG ? -suit.dashDirY * exSpd : -8.0 * p.upSign;
+      const spawnY = isZeroG ? sy : Math.max(0.25, sy - 0.40 * p.upSign);
       const slot = spawnBallistic(
         room,
         sx,
-        sy,
+        spawnY,
         sz,
-        -suit.dashDirX * DASH_EXHAUST_SPEED_M_S,
-        -suit.dashDirY * DASH_EXHAUST_SPEED_M_S,
-        -suit.dashDirZ * DASH_EXHAUST_SPEED_M_S,
-        packed,
-        BALLISTIC_FLAG.FIRED_BY_PLAYER,
+        -suit.dashDirX * exSpd,
+        exVy,
+        -suit.dashDirZ * exSpd,
+        qData.packed,
+        qData.flags,
       );
       if (slot !== -1) {
         chamber.liters -= 1;
@@ -715,6 +1106,52 @@ function stepJetpackDash(world: WorldState, input: InputFrame): void {
  * Normalizes quantized aim direction and runs Stage 1 suit actions in canonical order (§6.1):
  * (1) Siphon -> (2) Chamber charge decay -> (3) Nozzle tap/hold -> (4) Jetpack Dash & exhaust.
  */
+function findNearestAirlockInRange(world: WorldState): { door: DoorRecord; distSq: number } | null {
+  const doors = world.room.doors;
+  if (doors.length === 0) return null;
+  const px = world.player.x;
+  const py = world.player.y;
+  const pz = world.player.z;
+  let best: DoorRecord | null = null;
+  let bestDistSq = 2.0 * 2.0;
+
+  for (let i = 0; i < doors.length; i++) {
+    const d = doors[i];
+    const cx = (d.minX + d.maxX + 1) * 0.5 * VOXEL_SIZE_M;
+    const cz = (d.minZ + d.maxZ + 1) * 0.5 * VOXEL_SIZE_M;
+    const dx = px - cx;
+    const dz = pz - cz;
+    const dSq = dx * dx + dz * dz;
+    if (dSq > bestDistSq) continue;
+    if (Math.abs(py - 0.2) > 2.4) continue;
+    bestDistSq = dSq;
+    best = d;
+  }
+  return best ? { door: best, distSq: bestDistSq } : null;
+}
+
+function findNearestTerminalInRange(world: WorldState): { index: 0 | 1 | 2 | 3; distSq: number } | null {
+  const terms = world.room.workbenchTerminals;
+  if (terms.length === 0) return null;
+  const px = world.player.x;
+  const py = world.player.y;
+  const pz = world.player.z;
+  let bestIdx: 0 | 1 | 2 | 3 | null = null;
+  let bestDistSq = WORKBENCH_INTERACT_RANGE_M * WORKBENCH_INTERACT_RANGE_M;
+
+  for (let i = 0; i < terms.length; i++) {
+    const t = terms[i];
+    if (Math.abs(py - t.y) > 1.8) continue;
+    const dx = px - t.x;
+    const dz = pz - t.z;
+    const dSq = dx * dx + dz * dz;
+    if (dSq > bestDistSq) continue;
+    bestDistSq = dSq;
+    bestIdx = t.index;
+  }
+  return bestIdx !== null ? { index: bestIdx, distSq: bestDistSq } : null;
+}
+
 export function stepSuitActionsStage1(world: WorldState, input: InputFrame): void {
   const suit = world.suit;
   const len = Math.sqrt(
@@ -728,10 +1165,54 @@ export function stepSuitActionsStage1(world: WorldState, input: InputFrame): voi
 
   updateMagneticLockOn(world, input);
 
+  // Tab Nozzle Mode Selector: Stream -> Scatter (Shotgun) -> Lobber (Mortar)
+  if (input.pressCycleNozzle) {
+    suit.nozzleMode =
+      suit.nozzleMode === NOZZLE_MODE.STREAM
+        ? NOZZLE_MODE.SCATTER
+        : suit.nozzleMode === NOZZLE_MODE.SCATTER
+          ? NOZZLE_MODE.LOBBER
+          : NOZZLE_MODE.STREAM;
+    suit.nozzleTapBurstShotsLeft = 0;
+    suit.nozzleHoseActive = false;
+  }
+
+  // R Proportioning Valve: swaps active chamber without moving fluid/mass (§8.1)
+  if (input.pressSwapChamber && world.playerTank.baffled) {
+    world.playerTank.activeChamber = world.playerTank.activeChamber === 0 ? 1 : 0;
+  }
+
   stepAtomicSiphon(world, input);
   stepTankChargeDecay(world);
   stepLoadedNozzle(world, input);
   stepJetpackDash(world, input);
+
+  // §6.1 / L20: Nearest interactable wins when both terminal (<=1.5 m) and airlock (<=2.0 m) are in range
+  const nearDoor = findNearestAirlockInRange(world);
+  const nearTerm = findNearestTerminalInRange(world);
+  if (nearTerm !== null && (nearDoor === null || nearTerm.distSq <= nearDoor.distSq)) {
+    world.nearbyTerminalIndex = nearTerm.index;
+    world.nearbyDoor = null;
+  } else if (nearDoor !== null) {
+    world.nearbyDoor = nearDoor.door;
+    world.nearbyTerminalIndex = null;
+  } else {
+    world.nearbyDoor = null;
+    world.nearbyTerminalIndex = null;
+  }
+
+  if (input.pressInteract && world.pendingAirlock === null) {
+    if (world.nearbyTerminalIndex !== null) {
+      purchaseWorkbenchTerminal(world, world.nearbyTerminalIndex as 0 | 1 | 2 | 3);
+    } else if (world.deck !== null && world.nearbyDoor !== null && !world.nearbyDoor.locked) {
+      if (world.nearbyDoor.isExtraction) {
+        world.runCleared = true;
+        world.clearTimeS = world.simTick * FIXED_DT;
+      } else if (world.nearbyDoor.targetRoomId !== null) {
+        world.pendingAirlock = world.nearbyDoor;
+      }
+    }
+  }
 }
 
 export function applyDashVelocityIfActive(world: WorldState): boolean {

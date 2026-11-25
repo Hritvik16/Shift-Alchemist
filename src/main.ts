@@ -12,12 +12,22 @@ import {
   NOZZLE_TAP_SPEED_M_S,
   PLAYER_TORSO_OFFSET_M,
   VOXEL_SIZE_M,
-  nozzlePressureMult,
   byteToTempC,
+  nozzlePressureMult,
 } from './core/balance.ts';
 import { computeBallisticAimDir } from './core/combat.ts';
+import { generateDeckGraph, type DeckGraph } from './core/deckGen.ts';
 import { computePlumbLine, stepWorldTick } from './core/physics.ts';
-import { generateCargoHold, populateCargoHoldEntities } from './core/roomGen.ts';
+import {
+  AIRLOCK_MIN_CYCLE_FRAMES,
+  beginAirlockTransition,
+  createSnapshotStore,
+  getSnapshotStoreBytes,
+  loadInitialDeckRoom,
+  stepAirlockTransitionCore,
+  type AirlockTransitionJob,
+  type SnapshotStore,
+} from './core/snapshot.ts';
 import {
   applyStructuralDamage,
   carveSphereDebug,
@@ -38,6 +48,7 @@ import { DebugOverlay } from './viewer/debugOverlay.ts';
 import { EntityRenderer } from './viewer/entityRenderer.ts';
 import { FluidRenderer } from './viewer/fluidRenderer.ts';
 import { SuitHud } from './viewer/hud.ts';
+import { PlaytestBar } from './viewer/playtestBar.ts';
 import { PlayerRig } from './viewer/playerRig.ts';
 import { Scene3D } from './viewer/scene3D.ts';
 
@@ -53,7 +64,29 @@ const fluidRenderer = new FluidRenderer(scene3D.scene);
 const entityRenderer = new EntityRenderer(scene3D.scene);
 const playerRig = new PlayerRig(scene3D.scene);
 const hud = new SuitHud(app);
+const playtestBar = new PlaytestBar(document.body, world, hud, () => flushAllVisualCaches());
 const overlay = new DebugOverlay(app);
+
+let deck: DeckGraph = generateDeckGraph(initialSeed, false);
+let snapshotStore: SnapshotStore = createSnapshotStore();
+let airlockJob: AirlockTransitionJob | null = null;
+
+function flushAllVisualCaches(): void {
+  scene3D.resetRoomVisuals(world.room);
+  fluidRenderer.resetAll();
+  entityRenderer.reset();
+  scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
+
+  let remainingMesh = 1;
+  while (remainingMesh > 0) {
+    remainingMesh = scene3D.processDirtyMeshes(world.room, 900, 100);
+  }
+  scene3D.processDirtyDecals(world.room);
+  let remainingFluid = 1;
+  while (remainingFluid > 0) {
+    remainingFluid = fluidRenderer.update(world.room, scene3D.focusPos, 0, 900, 100);
+  }
+}
 
 function startNewRun(seed: number): void {
   const s = seed >>> 0;
@@ -63,9 +96,21 @@ function startNewRun(seed: number): void {
   world.siphonRank = 0;
   world.nozzlePressureRank = 0;
   world.gravCdRank = 0;
+  world.fuseRank = 0;
+  world.liningRank = 0;
+  world.hasSparkPlug = false;
+  world.hasPiezoArc = false;
+  world.hasCryoNozzle = false;
   world.has3GOverdrive = false;
+  world.hasGyroStabilizer = false;
+  world.hasAblativePlating = false;
+  world.nearbyTerminalIndex = null;
   world.scrap = 0;
-  world.player = createPlayerEntity(12.0, 0.2, 1.0);
+  world.kills = 0;
+  world.runCleared = false;
+  world.clearTimeS = 0;
+  world.nextEntityId = 1;
+  world.player = createPlayerEntity(4.0, 0.2, 4.0);
   world.playerTank = createStarterTank(0);
   world.suit = createSuitActionState();
   world.gravityPulse = {
@@ -84,25 +129,16 @@ function startNewRun(seed: number): void {
   world.zeroGLoftTicksLeft = 0;
   world.zeroGLoftDirY = 1;
   world.gravityChangedThisTick = false;
+  world.nearbyDoor = null;
+  world.pendingAirlock = null;
 
-  generateCargoHold(world.room, s);
-  populateCargoHoldEntities(world);
-  recomputeRoomLedgers(world.room, world.playerTank);
-  world.entryLedgers = { ...world.room.ledgers };
+  deck = generateDeckGraph(s, false);
+  snapshotStore = createSnapshotStore();
+  airlockJob = null;
 
-  scene3D.resetRoomVisuals();
-  fluidRenderer.resetAll();
-  entityRenderer.reset();
-  scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
-
-  let remainingMesh = 1;
-  while (remainingMesh > 0) {
-    remainingMesh = scene3D.processDirtyMeshes(world.room, 900, 100);
-  }
-  let remainingFluid = 1;
-  while (remainingFluid > 0) {
-    remainingFluid = fluidRenderer.update(world.room, scene3D.focusPos, 0, 900, 100);
-  }
+  hud.resetRun();
+  loadInitialDeckRoom(world, deck, deck.arrivalRoomId, null);
+  flushAllVisualCaches();
 }
 
 startNewRun(initialSeed);
@@ -113,6 +149,8 @@ let queuedC = false;
 let queuedV = false;
 let queuedDash = false;
 let queuedInteract = false;
+let queuedSwapChamber = false;
+let queuedCycleNozzle = false;
 let primaryHeld = false;
 let siphonHeld = false;
 let pointerX = window.innerWidth * 0.5;
@@ -137,7 +175,7 @@ window.addEventListener('pointerdown', (e) => {
     primaryHeld = true;
   } else if (e.button === 2) {
     siphonHeld = true;
-  } else if (e.button === 1 && overlay.visible && lastHit) {
+  } else if (e.button === 1 && overlay.visible && lastHit && airlockJob === null) {
     e.preventDefault();
     applyStructuralDamage(world.room, lastHit.x, lastHit.y, lastHit.z, 2, false, world.simTick);
   }
@@ -151,13 +189,13 @@ window.addEventListener('pointerup', (e) => {
 window.addEventListener(
   'wheel',
   (e) => {
-    scene3D.zoomDist = Math.max(12, Math.min(36, scene3D.zoomDist + e.deltaY * 0.015));
+    scene3D.zoomDist = Math.max(11, Math.min(28, scene3D.zoomDist + e.deltaY * 0.015));
   },
   { passive: true },
 );
 
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' || e.code === 'ShiftLeft' || e.code === 'F3') {
+  if (e.code === 'Space' || e.code === 'ShiftLeft' || e.code === 'F3' || e.code === 'F4' || e.code === 'Tab') {
     e.preventDefault();
   }
   if (e.code === 'F3') {
@@ -170,10 +208,13 @@ window.addEventListener('keydown', (e) => {
     else if (e.code === 'KeyV') queuedV = true;
     else if (e.code === 'Space') queuedDash = true;
     else if (e.code === 'KeyF') queuedInteract = true;
+    else if (e.code === 'KeyR') queuedSwapChamber = true;
+    else if (e.code === 'Tab') queuedCycleNozzle = true;
+    else if (e.code === 'F4') playtestBar.toggle();
   }
   keys.add(e.code);
 
-  if (overlay.visible && lastHit && e.key >= '1' && e.key <= '6') {
+  if (overlay.visible && lastHit && airlockJob === null && e.key >= '1' && e.key <= '6') {
     carveSphereDebug(world.room, lastHit.x, lastHit.y, lastHit.z, Number(e.key), world.simTick);
   }
 });
@@ -272,12 +313,16 @@ function sampleInput(hoverHit: VoxelRayHit | null): InputFrame {
     siphonHeld,
     pressDash: queuedDash,
     pressInteract: queuedInteract,
+    pressSwapChamber: queuedSwapChamber,
+    pressCycleNozzle: queuedCycleNozzle,
   };
   queuedQ = false;
   queuedC = false;
   queuedV = false;
   queuedDash = false;
   queuedInteract = false;
+  queuedSwapChamber = false;
+  queuedCycleNozzle = false;
   return frame;
 }
 
@@ -291,6 +336,9 @@ let fastFrameStreak = 0;
 let adaptiveFallback = false;
 let ledgerCheckCounter = 0;
 let cameraShake = 0;
+let hitstopFrames = 0;
+let lastGravityMode = world.room.gravityMode;
+let lastNozzleMode = world.suit.nozzleMode;
 
 function percentile(sorted: Float64Array, p: number): number {
   if (sorted.length === 0) return 0;
@@ -307,25 +355,58 @@ function tick(now: number): void {
   frameWrite = (frameWrite + 1) % frameWindow.length;
   if (frameFilled < frameWindow.length) frameFilled++;
 
-
-  accumulator += clampedDt;
   const simStart = performance.now();
-  let ticksThisFrame = 0;
-  while (accumulator >= FIXED_DT && ticksThisFrame < 3) {
-    const inp = sampleInput(lastHit);
-    if (inp.pressInteract && world.runCleared) {
-      startNewRun((world.runSeed + 1) >>> 0);
-      accumulator = 0;
-      break;
+  let dirtyQueue = 0;
+  let dirtyFluidQueue = 0;
+
+  if (airlockJob !== null) {
+    // Paused atomic airlock cycle (§4.2, §4.4): 64 chunks/frame RLE + 10 ms/frame mesh/fluid rebuild
+    queuedQ = false;
+    queuedC = false;
+    queuedV = false;
+    queuedDash = false;
+    queuedInteract = false;
+    queuedSwapChamber = false;
+    queuedCycleNozzle = false;
+    accumulator = 0;
+
+    const coreReady = stepAirlockTransitionCore(airlockJob, world, deck);
+    if (coreReady && airlockJob.visualResetPending) {
+      airlockJob.visualResetPending = false;
+      scene3D.resetRoomVisuals(world.room);
+      fluidRenderer.resetAll();
+      entityRenderer.reset();
+      scene3D.focusPos.set(world.player.x, world.player.y, world.player.z);
     }
-    stepWorldTick(world, inp);
-    if (world.player.hp <= 0) {
-      startNewRun(Date.now() >>> 0);
-      accumulator = 0;
-      break;
+  } else if (hitstopFrames > 0) {
+    hitstopFrames--;
+    accumulator = 0;
+  } else {
+    accumulator += clampedDt;
+    let ticksThisFrame = 0;
+    while (accumulator >= FIXED_DT && ticksThisFrame < 3) {
+      const inp = sampleInput(lastHit);
+      if (inp.pressInteract && world.runCleared) {
+        startNewRun((world.runSeed + 1) >>> 0);
+        accumulator = 0;
+        break;
+      }
+      stepWorldTick(world, inp);
+      if (world.pendingAirlock !== null && world.pendingAirlock.targetRoomId !== null) {
+        const door = world.pendingAirlock;
+        world.pendingAirlock = null;
+        airlockJob = beginAirlockTransition(world, snapshotStore, door.targetRoomId!, door.targetFace);
+        accumulator = 0;
+        break;
+      }
+      if (world.player.hp <= 0) {
+        startNewRun(Date.now() >>> 0);
+        accumulator = 0;
+        break;
+      }
+      accumulator -= FIXED_DT;
+      ticksThisFrame++;
     }
-    accumulator -= FIXED_DT;
-    ticksThisFrame++;
   }
   const simMs = performance.now() - simStart;
 
@@ -357,46 +438,89 @@ function tick(now: number): void {
   const shakeY = cameraShake > 0 ? Math.cos(timeSec * 83.0) * cameraShake * 0.6 : 0;
   const shakeZ = cameraShake > 0 ? Math.sin(timeSec * 73.0 + 1.3) * cameraShake : 0;
 
+  if (world.suit.nozzleMode !== lastNozzleMode) {
+    lastNozzleMode = world.suit.nozzleMode;
+    hud.spawnCallout(world.player.x, world.player.y + 1.4, world.player.z, `NOZZLE: ${lastNozzleMode.toUpperCase()}`, 0xffd166);
+  }
+  if (world.room.gravityMode !== lastGravityMode) {
+    lastGravityMode = world.room.gravityMode;
+    const gCol =
+      lastGravityMode === '0G' ? 0x62f2ff : lastGravityMode === '-1G' ? 0xff6be6 : lastGravityMode === '1G' ? 0x5ef2d6 : 0xffb347;
+    hud.spawnCallout(world.player.x, world.player.y + 1.6, world.player.z, `SHIFT: ${lastGravityMode}`, gCol);
+  }
+
+  for (let i = 0; i < world.room.combatEvents.length; i++) {
+    const ev = world.room.combatEvents[i];
+    if (ev.label) hud.spawnCallout(ev.x, ev.y, ev.z, ev.label, ev.colorHex);
+    if (ev.kind === 'splat' || ev.kind === 'shatter' || ev.kind === 'kill') {
+      hitstopFrames = Math.max(hitstopFrames, ev.kind === 'shatter' ? 3 : 2);
+      cameraShake = Math.min(0.24, cameraShake + (ev.kind === 'shatter' ? 0.16 : 0.1));
+    }
+  }
+
   scene3D.focusPos.set(world.player.x + shakeX, world.player.y + shakeY, world.player.z + shakeZ);
-  scene3D.updateCamera();
-  entityRenderer.update(world, scene3D.camera, timeSec, clampedDt);
-  lastHit = scene3D.pickVoxel(world.room, pointerX, pointerY);
-
-  const remeshCap = adaptiveFallback ? MAX_REMESHES_FALLBACK : MAX_REMESHES_PER_FRAME;
-  const fluidRebuildCap = adaptiveFallback
-    ? MAX_FLUID_CACHE_REBUILDS_FALLBACK
-    : MAX_FLUID_CACHE_REBUILDS_PER_FRAME;
-
-  const dirtyQueue = scene3D.processDirtyMeshes(world.room, remeshCap, 0);
-  scene3D.processDirtyDecals(world.room);
-  const dirtyFluidQueue = fluidRenderer.update(
-    world.room,
-    scene3D.focusPos,
-    timeSec,
-    fluidRebuildCap,
-    0,
+  scene3D.updateCamera(
+    world.room.gravityMode,
+    world.room.roomW,
+    world.suit.aimDirX,
+    world.suit.aimDirZ,
+    clampedDt,
   );
+  scene3D.updateGravityAtmosphere(world.room, clampedDt, timeSec);
+  scene3D.syncDoors(world.room, timeSec);
+  entityRenderer.update(world, scene3D.camera, timeSec, clampedDt);
+  world.room.combatEvents.length = 0;
+  hud.updateCallouts(scene3D.camera, clampedDt);
+  lastHit = airlockJob === null ? scene3D.pickVoxel(world.room, pointerX, pointerY) : null;
+
+  if (airlockJob !== null && airlockJob.phase === 'mesh') {
+    dirtyQueue = scene3D.processDirtyMeshes(world.room, 900, 10);
+    scene3D.processDirtyDecals(world.room);
+    dirtyFluidQueue = fluidRenderer.update(world.room, scene3D.focusPos, timeSec, 900, 10);
+    if (dirtyQueue === 0 && dirtyFluidQueue === 0 && airlockJob.framesElapsed >= AIRLOCK_MIN_CYCLE_FRAMES) {
+      airlockJob.phase = 'done';
+      airlockJob = null;
+    }
+  } else if (airlockJob === null) {
+    const remeshCap = adaptiveFallback ? MAX_REMESHES_FALLBACK : MAX_REMESHES_PER_FRAME;
+    const fluidRebuildCap = adaptiveFallback
+      ? MAX_FLUID_CACHE_REBUILDS_FALLBACK
+      : MAX_FLUID_CACHE_REBUILDS_PER_FRAME;
+
+    dirtyQueue = scene3D.processDirtyMeshes(world.room, remeshCap, 0);
+    scene3D.processDirtyDecals(world.room);
+    dirtyFluidQueue = fluidRenderer.update(
+      world.room,
+      scene3D.focusPos,
+      timeSec,
+      fluidRebuildCap,
+      0,
+    );
+  }
+
   scene3D.render();
   const renderMs = performance.now() - renderStart;
   const workMs = simMs + renderMs;
-  if (workMs > 15.0 || rawDtMs > 19.0) {
-    slowFrameStreak++;
-    fastFrameStreak = 0;
-    if (slowFrameStreak >= 4) adaptiveFallback = true;
-  } else if (workMs < 12.0 && rawDtMs < 18.0) {
-    fastFrameStreak++;
-    slowFrameStreak = 0;
-    if (fastFrameStreak >= 4) adaptiveFallback = false;
-  } else {
-    slowFrameStreak = 0;
-    fastFrameStreak = 0;
+  if (airlockJob === null) {
+    if (workMs > 15.0 || rawDtMs > 19.0) {
+      slowFrameStreak++;
+      fastFrameStreak = 0;
+      if (slowFrameStreak >= 4) adaptiveFallback = true;
+    } else if (workMs < 12.0 && rawDtMs < 18.0) {
+      fastFrameStreak++;
+      slowFrameStreak = 0;
+      if (fastFrameStreak >= 4) adaptiveFallback = false;
+    } else {
+      slowFrameStreak = 0;
+      fastFrameStreak = 0;
+    }
   }
 
-  hud.update(world);
+  hud.update(world, airlockJob !== null);
 
   if (overlay.visible) {
     ledgerCheckCounter++;
-    if (ledgerCheckCounter % 15 === 0) {
+    if (ledgerCheckCounter % 15 === 0 && airlockJob === null) {
       recomputeRoomLedgers(world.room, world.playerTank);
     }
 
@@ -410,9 +534,9 @@ function tick(now: number): void {
       ch.liters > 0 && ch.mat !== MAT.AIR
         ? `${MATERIAL_SPEC[ch.mat].name} ${ch.liters}/${ch.capL}L (${byteToTempC(ch.tempByte)}C)`
         : `EMPTY 0/${ch.capL}L (Air Burst)`;
-    const lockOnInfo = world.lockOn
-      ? `${world.lockOn.kind}#${world.lockOn.id}`
-      : 'none';
+    const lockOnInfo = world.lockOn ? `${world.lockOn.kind}#${world.lockOn.id}` : 'none';
+    const curNode = deck.nodes[world.currentRoomId];
+    const roomInfo = `#${curNode.id} ${curNode.template}`;
 
     overlay.update({
       fps: 1000 / Math.max(0.001, avgMs),
@@ -427,6 +551,8 @@ function tick(now: number): void {
       dirtyQueue,
       dirtyFluidQueue,
       meshMemMB: scene3D.getTotalMeshMemMB(),
+      snapMemMB: getSnapshotStoreBytes(snapshotStore) / (1024 * 1024),
+      roomInfo,
       decalCount: scene3D.getDecalCount(),
       activeFluidCount: world.room.activeFluidCurCount,
       activeThermalCount: world.room.activeThermalCurCount,

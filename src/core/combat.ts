@@ -9,6 +9,7 @@ import {
   AIR_BURST_RECOIL_0G,
   AIR_BURST_TIER1_DMG,
   AIR_BURST_TIER2_DMG,
+  ARMORED_RAW_DMG_MULT,
   ARENA_W,
   CHUNKS_X,
   CHUNKS_Z,
@@ -36,6 +37,7 @@ import {
   WALL_SPLAT_V_MIN,
   nozzlePressureMult,
 } from './balance.ts';
+import { applyEntityStun, burstAlienGlandsOnDeath } from './ai.ts';
 import { hash32 } from './hash.ts';
 import {
   applyStructuralDamage,
@@ -44,6 +46,7 @@ import {
   getTempByte,
   inRoomBounds,
   isFluidOrGasMat,
+  pushCombatEvent,
   type RoomState,
   type VatRecord,
 } from './types.ts';
@@ -527,12 +530,50 @@ export function fireCompressedAirBurst(world: WorldState): void {
 
     if (!hasAirBurstLOS(room, ox, oy, oz, tx, ty, tz)) continue;
 
-    e.hp = Math.max(0, e.hp - AIR_BURST_DMG);
+    const isArmored = e.carapace === 'armored';
+    const isEmbrittled = e.tempByte <= TEMP_BYTE.EMBRITTLED;
+    let burstDmg = AIR_BURST_DMG;
+    let burstKind: 'damage' | 'shatter' = 'damage';
+    let burstColor = 0xbef6ff;
+    let burstLabel = `-${AIR_BURST_DMG}`;
+
+    if (isEmbrittled) {
+      // Cryo-frozen targets shatter dramatically on kinetic Air Burst (3x brittle shatter!)
+      burstDmg = 45;
+      burstKind = 'shatter';
+      burstColor = 0x7ef9ff;
+      burstLabel = `3x CRYO SHATTER! -${burstDmg}`;
+    } else if (isArmored) {
+      burstDmg = AIR_BURST_DMG > 0 ? Math.max(1, Math.round(AIR_BURST_DMG * ARMORED_RAW_DMG_MULT)) : 0;
+      burstColor = 0x9aa7b8;
+      burstLabel = room.gravityMode === GRAVITY_MODE.G0 ? '0G PUNT!' : 'ARMORED (USE ALCHEMY/0G)';
+    } else {
+      burstDmg = AIR_BURST_DMG;
+      burstLabel = burstDmg > 0 ? `-${burstDmg}` : 'SHOVE';
+    }
+
+    if (burstDmg > 0) {
+      e.hp = Math.max(0, e.hp - burstDmg);
+    }
+    pushCombatEvent(room, {
+      kind: burstKind,
+      entityId: e.id,
+      x: e.x,
+      y: e.y + e.height,
+      z: e.z,
+      value: burstDmg,
+      colorHex: burstColor,
+      label: burstLabel,
+    });
     const massKg = getEffectiveMassKg(e);
-    const dv = Math.max(
+    let dv = Math.max(
       AIR_BURST_DELTAV_MIN,
       Math.min(AIR_BURST_DELTAV_MAX, nomImpulse / Math.max(1, massKg)),
     );
+    // Heavy plating braces against 1G Air Burst knockback, but stays fully puntable in 0G or when embrittled
+    if (isArmored && !isEmbrittled && room.gravityMode !== GRAVITY_MODE.G0) {
+      dv *= 0.55;
+    }
 
     let dirX = ax;
     let dirY = ay;
@@ -548,6 +589,9 @@ export function fireCompressedAirBurst(world: WorldState): void {
     e.vz += dirZ * dv;
     e.grounded = false;
     e.impulseTimer = IMPULSE_TIMER_TICKS;
+    if (e.kind === 'alien' && (e.aiState === 'telegraph' || (isArmored && isEmbrittled))) {
+      applyEntityStun(room, e, 45, e.aiState === 'telegraph', isEmbrittled);
+    }
   }
 
   // 2. Deterministic 5x5 (25-ray) cone deduplicated by hit voxel idx
@@ -642,11 +686,12 @@ export function fireCompressedAirBurst(world: WorldState): void {
     }
   }
 
-  // 3. 0G recoil (-2.5 m/s)
+  // 3. 0G recoil (-2.5 m/s, halved by Gyro Stabilizer)
   if (room.gravityMode === GRAVITY_MODE.G0) {
-    p.vx -= ax * AIR_BURST_RECOIL_0G;
-    p.vy -= ay * AIR_BURST_RECOIL_0G;
-    p.vz -= az * AIR_BURST_RECOIL_0G;
+    const rec = AIR_BURST_RECOIL_0G * (world.hasGyroStabilizer ? 0.5 : 1.0);
+    p.vx -= ax * rec;
+    p.vy -= ay * rec;
+    p.vz -= az * rec;
   }
 }
 
@@ -766,19 +811,36 @@ export function resolveEntityEntityCollisions(world: WorldState): void {
         const targetDashImmune =
           target.kind === 'player' && (target.dashTimer > 0 || target.dashGraceTimer > 0);
         if (!targetDashImmune && target.impactIFrames === 0) {
-          const dmg = computeWallSplatDamage(strikerMass, closingSpeed, target.tempByte);
+          const brittle = target.tempByte <= TEMP_BYTE.EMBRITTLED;
+          let dmg = computeWallSplatDamage(strikerMass, closingSpeed, target.tempByte);
+          if (dmg > 0 && target.carapace === 'armored' && !brittle) {
+            dmg = Math.max(1, Math.round(dmg * ARMORED_RAW_DMG_MULT));
+          }
+          if (dmg > 0 && target.kind === 'player' && world.hasAblativePlating) dmg = Math.max(1, Math.round(dmg * 0.7));
           if (dmg > 0) {
             target.hp = Math.max(0, target.hp - dmg);
             target.impactIFrames = IMPACT_IFRAMES_TICKS;
+            if (dmg >= 20 && target.kind === 'alien') applyEntityStun(world.room, target, 45, false, brittle);
+            pushCombatEvent(world.room, {
+              kind: brittle ? 'shatter' : 'splat',
+              entityId: target.id,
+              x: target.x,
+              y: target.y + target.height,
+              z: target.z,
+              value: dmg,
+              colorHex: brittle ? 0x7ef9ff : 0xffbe55,
+              label: brittle ? `3x SHATTER! -${dmg}` : `SLAM! -${dmg}`,
+            });
           }
         }
 
         const strikerDashImmune =
           striker.kind === 'player' && (striker.dashTimer > 0 || striker.dashGraceTimer > 0);
         if (!strikerDashImmune && striker.impactIFrames === 0) {
-          const recoil = Math.round(
+          let recoil = Math.round(
             computeWallSplatDamage(strikerMass, closingSpeed, striker.tempByte) * 0.5,
           );
+          if (recoil > 0 && striker.kind === 'player' && world.hasAblativePlating) recoil = Math.max(1, Math.round(recoil * 0.7));
           if (recoil > 0) {
             striker.hp = Math.max(0, striker.hp - recoil);
             striker.impactIFrames = IMPACT_IFRAMES_TICKS;
@@ -809,12 +871,58 @@ export function resolveStage8DeathsAndClear(world: WorldState): void {
 
   for (let i = 0; i < world.entities.length; i++) {
     const e = world.entities[i];
+    if (e.deathHusk) {
+      const stillHasFluid = e.glands.some((g) => g.liters > 0);
+      if (stillHasFluid) world.entities[write++] = e;
+      continue;
+    }
     if (e.hp <= 0) {
       if (e.kind === 'alien') {
         world.kills++;
-        world.scrap += SCRAP_DROPS.skitterer;
-      } else if (e.kind === 'crate' && e.bioCache) {
-        world.scrap += SCRAP_DROPS.bioCache;
+        const dropScrap = e.locomotion === 'crusher' ? SCRAP_DROPS.crusher : SCRAP_DROPS.skitterer;
+        world.scrap += dropScrap;
+        const label =
+          e.locomotion === 'crusher'
+            ? `BRUISER DOWN +${dropScrap}`
+            : e.locomotion === 'floater'
+              ? `FLOATER DOWN +${dropScrap}`
+              : e.locomotion === 'spitter'
+                ? `SPITTER DOWN +${dropScrap}`
+                : e.locomotion === 'skitterer'
+                  ? `SKITTERER DOWN +${dropScrap}`
+                  : `POD DESTROYED +${dropScrap}`;
+        pushCombatEvent(world.room, {
+          kind: 'kill',
+          entityId: e.id,
+          x: e.x,
+          y: e.y + e.height * 0.6,
+          z: e.z,
+          value: dropScrap,
+          colorHex: 0xff4d79,
+          label,
+        });
+        if (world.lockOn && world.lockOn.kind === 'alien' && world.lockOn.id === e.id) {
+          world.lockOn = null;
+        }
+        const drained = burstAlienGlandsOnDeath(world, e);
+        if (!drained) {
+          e.deathHusk = true;
+          e.hp = 0;
+          world.entities[write++] = e;
+        }
+        continue;
+      } else if (e.kind === 'crate') {
+        if (e.bioCache) world.scrap += SCRAP_DROPS.bioCache;
+        pushCombatEvent(world.room, {
+          kind: 'crate_break',
+          entityId: e.id,
+          x: e.x,
+          y: e.y + e.height * 0.6,
+          z: e.z,
+          value: e.bioCache ? SCRAP_DROPS.bioCache : 0,
+          colorHex: e.bioCache ? 0x5ef2d6 : 0xc9965b,
+          label: e.bioCache ? `BIO-CACHE +${SCRAP_DROPS.bioCache} SCRAP` : '',
+        });
       }
       if (world.lockOn && (world.lockOn.kind === 'alien' || world.lockOn.kind === 'crate') && world.lockOn.id === e.id) {
         world.lockOn = null;
@@ -829,7 +937,15 @@ export function resolveStage8DeathsAndClear(world: WorldState): void {
   world.entities.length = write;
   world.podsRemaining = remainingPods;
 
-  if (!world.runCleared && world.podsTotal > 0 && remainingPods === 0) {
+  if (world.deck !== null) {
+    if (!world.room.cleared && world.podsTotal > 0 && remainingPods === 0) {
+      world.room.cleared = true;
+      for (let d = 0; d < world.room.doors.length; d++) {
+        world.room.doors[d].locked = false;
+      }
+      world.scrap += SCRAP_DROPS.roomClear;
+    }
+  } else if (!world.runCleared && world.podsTotal > 0 && remainingPods === 0) {
     world.runCleared = true;
     world.clearTimeS = world.simTick * FIXED_DT;
     world.scrap += SCRAP_DROPS.roomClear;

@@ -5,15 +5,15 @@ import {
   PLAYER_MAX_HP,
   TEMP_BYTE,
   gravCooldownS,
-} from './balance.ts';
-import { generateCargoHold } from './roomGen.ts';
-import { computePlumbLine, computeWallSplatDamage, stepWorldTick } from './physics.ts';
+} from '../src/core/balance.ts';
+import { generateCargoHold } from '../src/core/roomGen.ts';
+import { computePlumbLine, computeWallSplatDamage, stepWorldTick } from '../src/core/physics.ts';
 import {
   createEmptyInput,
   createWorldState,
   getFeetY,
   type WorldState,
-} from './world.ts';
+} from '../src/core/world.ts';
 
 function makeCargoWorld(seed = 1337): WorldState {
   const world = createWorldState(seed);

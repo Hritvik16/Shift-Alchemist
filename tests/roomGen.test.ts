@@ -9,8 +9,8 @@ import {
   TEMP_BYTE,
   VAT_VOLUME_MAX_L,
   VAT_VOLUME_MIN_L,
-} from './balance.ts';
-import { generateCargoHold } from './roomGen.ts';
+} from '../src/core/balance.ts';
+import { generateCargoHold } from '../src/core/roomGen.ts';
 import {
   carveSphereDebug,
   cellChunkIndex,
@@ -20,7 +20,7 @@ import {
   getTempByte,
   packVoxel,
   writeCell,
-} from './types.ts';
+} from '../src/core/types.ts';
 
 describe('Cargo Hold Generator & Shared Structural Resolver (M1.1)', () => {
   it('seals all 6 outer faces with BOUNDARY_HULL and builds pit, vestibule, catwalk, vats', () => {

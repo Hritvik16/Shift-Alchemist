@@ -53,9 +53,9 @@ export const MAX_MESH_MEM_MB = 48;
 export const SNAP_DEFLATE_MB = 24;
 export const MAX_SNAP_MEM_MB = 32;
 export const MAX_DAMAGE_DECALS = 512;
-export const MAX_BFS_EMITTER = 1_024;
-export const MAX_BFS_GLOBAL = 2_048;
-export const BFS_MANHATTAN_RADIUS = 80;
+export const MAX_BFS_EMITTER = 2_048;
+export const MAX_BFS_GLOBAL = 4_096;
+export const BFS_MANHATTAN_RADIUS = 120;
 export const MAX_EXPLOSIONS_PER_TICK = 4;
 export const MAX_EXPLOSIONS_PER_TICK_REDUCED = 2;
 export const MAX_EXPLOSION_QUEUE = 32;
@@ -89,6 +89,25 @@ export const CORRIDOR_DIMS: RoomDims = { w: 80, h: 48, d: 240, chunks: 225 };
 export const REACTOR_DIMS: RoomDims = { w: 160, h: 64, d: 160, chunks: 400 };
 export const CARGO_HOLD_DIMS: RoomDims = { w: 240, h: 64, d: 240, chunks: 900 };
 export const BOSS_SANCTUM_DIMS: RoomDims = { w: 240, h: 64, d: 240, chunks: 900 };
+
+export const PARAMETRIC_CORRIDOR_DIMS: readonly RoomDims[] = [
+  { w: 112, h: 64, d: 160, chunks: (112 / 16) * 4 * (160 / 16) },
+  { w: 128, h: 64, d: 176, chunks: (128 / 16) * 4 * (176 / 16) },
+  { w: 144, h: 64, d: 128, chunks: (144 / 16) * 4 * (128 / 16) },
+];
+
+export const PARAMETRIC_REACTOR_DIMS: readonly RoomDims[] = [
+  { w: 112, h: 64, d: 112, chunks: (112 / 16) * 4 * (112 / 16) },
+  { w: 128, h: 64, d: 128, chunks: (128 / 16) * 4 * (128 / 16) },
+  { w: 144, h: 64, d: 144, chunks: (144 / 16) * 4 * (144 / 16) },
+  { w: 160, h: 64, d: 144, chunks: (160 / 16) * 4 * (144 / 16) },
+];
+
+export const PARAMETRIC_CARGO_DIMS: readonly RoomDims[] = [
+  { w: 160, h: 64, d: 160, chunks: (160 / 16) * 4 * (160 / 16) },
+  { w: 176, h: 64, d: 144, chunks: (176 / 16) * 4 * (144 / 16) },
+  { w: 208, h: 64, d: 176, chunks: (208 / 16) * 4 * (176 / 16) },
+];
 
 export const ALL_ROOM_DIMS: readonly RoomDims[] = [
   ARRIVAL_DIMS,
@@ -162,15 +181,60 @@ export const NOZZLE_HOLD_RATE_LPS = 60;
 export const NOZZLE_HOLD_SPEED_M_S = 9.0;
 export const NOZZLE_HOLD_RECOIL_0G = 0.08;
 
+export const NOZZLE_MODE = {
+  STREAM: 'stream',
+  SCATTER: 'scatter',
+  LOBBER: 'lobber',
+} as const;
+export type NozzleMode = (typeof NOZZLE_MODE)[keyof typeof NOZZLE_MODE];
+
+export const NOZZLE_SCATTER_SHOT_L = 10;
+export const NOZZLE_SCATTER_SPEED_M_S = 11.5;
+export const NOZZLE_SCATTER_CD_TICKS = 25; // 0.42 s
+export const NOZZLE_SCATTER_RECOIL_0G = 1.05;
+
+export const NOZZLE_LOBBER_SHOT_L = 12;
+export const NOZZLE_LOBBER_SPEED_M_S = 10.5;
+export const NOZZLE_LOBBER_CD_TICKS = 30; // 0.50 s
+export const NOZZLE_LOBBER_RECOIL_0G = 1.15;
+
+export const SKITTERER_DRY_MASS_KG = 45;
+export const SKITTERER_MAX_HP = 45;
+export const BRUISER_DRY_MASS_KG = 165;
+export const BRUISER_MAX_HP = 150;
+export const BRUISER_W_M = 1.4;
+export const BRUISER_H_M = 1.6;
+export const BRUISER_D_M = 1.4;
+export const BRUISER_GLAND_CAP_L = 24;
+export const ARMORED_RAW_DMG_MULT = 0.25;
+export const SPITTER_DRY_MASS_KG = 50;
+export const SPITTER_MAX_HP = 55;
+export const SPITTER_W_M = 1.0;
+export const SPITTER_H_M = 1.1;
+export const SPITTER_D_M = 1.0;
+export const SPITTER_GLAND_CAP_L = 36;
+export const FLOATER_DRY_MASS_KG = 35;
+export const FLOATER_MAX_HP = 50;
+export const FLOATER_W_M = 1.1;
+export const FLOATER_D_M = 1.1;
+export const FLOATER_GLAND_CAP_L = 24;
+export const FLOATER_CRUSH_MULT = 2.5;
+export const SKITTERER_W_M = 1.1;
+export const SKITTERER_H_M = 0.9;
+export const SKITTERER_D_M = 1.1;
+export const SKITTERER_GLAND_CAP_L = 18;
+export const STUN_DURATION_TICKS = 45; // 0.75 s (§8.2)
+export const STUN_IMMUNITY_TICKS = 120; // 2.0 s (§8.2)
+
 export function nozzlePressureMult(rank: number): number {
   return 1.0 + 0.2 * rank;
 }
 
-export const AIR_BURST_RANGE_M = 4.0;
+export const AIR_BURST_RANGE_M = 5.5;
 export const AIR_BURST_CD_S = 0.25;
 export const AIR_BURST_IMPULSE_NOM = 960;
 export const AIR_BURST_CONE_DEG = 25;
-export const AIR_BURST_DMG = 5;
+export const AIR_BURST_DMG = 0; // Pure kinetic tool: kills require Wall-Splat, Gravity-Slam, Cryo Shatter, or Alchemy
 export const AIR_BURST_DELTAV_MIN = 2.5;
 export const AIR_BURST_DELTAV_MAX = 14.0;
 export const AIR_BURST_RAYS = 25;
@@ -206,12 +270,12 @@ export const SIPHON_CONE_DEG = 35;
 export const SIPHON_CONE_COS = 0.8191520442889918; // cos(35 deg), deterministic constant
 export const SIPHON_CONE_COS_SQ = SIPHON_CONE_COS * SIPHON_CONE_COS;
 
-export const DASH_SPEED_M_S = 14.0;
-export const DASH_EXHAUST_L = 24;
+export const DASH_SPEED_M_S = 13.5;
+export const DASH_EXHAUST_L = 14;
 export const DASH_EXHAUST_SPEED_M_S = 0.5;
-export const DASH_CD_S = 1.2;
-export const DASH_CD_TICKS = 72; // 1.2 s @ 60 Hz
-export const DASH_DURATION_TICKS = 24; // 0.4 s @ 60 Hz
+export const DASH_CD_S = 0.85;
+export const DASH_CD_TICKS = 51; // 0.85 s @ 60 Hz
+export const DASH_DURATION_TICKS = 14; // 0.23 s (~3.15 m) @ 60 Hz
 export const DASH_GRACE_TICKS = 9; // 0.15 s @ 60 Hz
 
 export const GRAV_CD_BASE_S = 4.0;

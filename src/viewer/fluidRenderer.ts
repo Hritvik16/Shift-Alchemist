@@ -42,7 +42,7 @@ export class FluidRenderer {
   public renderedBallisticCount = 0;
   public lastRebuiltChunks = 0;
 
-  // Cosmetic viewer-only cryo sublimation vapor wisps (zero sim/ledger impact)
+  // Cosmetic viewer-only cryo cold mist & sublimation vapor wisps (zero sim/ledger impact)
   private readonly vaporMax = 256;
   private readonly vaporPos = new Float32Array(256 * 3);
   private readonly vaporAge = new Float32Array(256);
@@ -54,6 +54,7 @@ export class FluidRenderer {
   private readonly vaporScaleVec = new THREE.Vector3();
   private readonly vaporQuat = new THREE.Quaternion();
   private lastTimeSec = 0;
+  private lastCryoMistStep = -1;
 
   constructor(scene: THREE.Scene) {
     const baseBox = new THREE.BoxGeometry(VOXEL_SIZE_M, VOXEL_SIZE_M, VOXEL_SIZE_M);
@@ -82,7 +83,7 @@ export class FluidRenderer {
     const material = new THREE.ShaderMaterial({
       uniforms: {
         uPalette: { value: paletteVecs },
-        uLightDir: { value: new THREE.Vector3(0.55, 0.72, 0.48).normalize() },
+        uLightDir: { value: new THREE.Vector3(0.55, 0.78, 0.42).normalize() },
         uTime: { value: 0 },
       },
       vertexShader: `
@@ -93,6 +94,7 @@ export class FluidRenderer {
         varying vec3 vColor;
         varying float vMatId;
         varying float vElec;
+        varying float vShimmer;
 
         void main() {
           float pIdx = floor(aInstanceData.w + 0.5);
@@ -106,6 +108,7 @@ export class FluidRenderer {
           vColor = baseCol;
           vMatId = float(matId);
           vElec = isElec;
+          vShimmer = shimmer;
           vNormal = normal;
 
           vec3 worldPos = position + aInstanceData.xyz;
@@ -121,57 +124,118 @@ export class FluidRenderer {
         varying vec3 vColor;
         varying float vMatId;
         varying float vElec;
+        varying float vShimmer;
+
+        float hash31(vec3 p) {
+          p = fract(p * 0.1031);
+          p += dot(p, p.yzx + 33.33);
+          return fract((p.x + p.y) * p.z);
+        }
 
         void main() {
           vec3 N = normalize(vNormal);
           vec3 V = normalize(cameraPosition - vWorldPos);
-          float ndl = max(dot(N, uLightDir), 0.0);
-          float hemi = 0.45 + 0.55 * (N.y * 0.5 + 0.5);
-          float fresnel = pow(1.0 - max(dot(N, V), 0.0), 2.2);
+          vec3 L = normalize(uLightDir);
+          vec3 H = normalize(L + V);
+          float ndl = max(dot(N, L), 0.0);
+          float ndv = clamp(max(dot(N, V), 0.0), 0.0, 1.0);
+          float hemi = 0.44 + 0.56 * (N.y * 0.5 + 0.5);
+          float fresnel = pow(1.0 - ndv, 2.3);
+          float spec = pow(max(dot(N, H), 0.0), 36.0);
 
-          vec3 col = vColor * (0.68 * hemi + 0.48 * ndl);
+          vec3 cellId = floor(vWorldPos * 10.0);
+          vec3 col = vColor * (0.64 * hemi + 0.46 * ndl);
+          float alpha = 0.96;
 
-          // Material-specific rim tint (Noita/Teardown legibility without alpha sorting)
           if (vMatId > 0.5 && vMatId < 1.5) {
-            col += vec3(0.28, 0.62, 0.92) * fresnel * 0.55;
+            // WATER: calm, clean translucent cerulean liquid (no boiling spots or vertical stripes)
+            float gentleGlint = 0.5 + 0.5 * sin(uTime * 0.85 + vWorldPos.x * 1.4 + vWorldPos.z * 1.1);
+            vec3 deepWater = vec3(0.09, 0.36, 0.64);
+            vec3 brightWater = vec3(0.20, 0.58, 0.86);
+            col = mix(deepWater, brightWater, 0.52 * hemi + 0.36 * ndl) * (0.95 + 0.014 * vShimmer);
+            col += vec3(0.45, 0.82, 0.98) * fresnel * (0.34 + 0.06 * gentleGlint);
+            col += vec3(0.88, 0.96, 1.0) * spec * 0.65;
+            alpha = clamp(0.64 + 0.24 * fresnel + spec * 0.14, 0.62, 0.90);
           } else if (vMatId > 1.5 && vMatId < 2.5) {
-            col += vec3(0.55, 0.38, 0.16) * fresnel * 0.65;
+            // OIL: unmistakable glossy dark pitch-black crude with subtle petrol sheen strictly on highlights/rims
+            float slickPhase = ndv * 7.5 + (vWorldPos.x * 0.9 - vWorldPos.z * 0.7);
+            vec3 irid = 0.5 + 0.5 * cos(slickPhase + vec3(0.0, 2.0, 4.1));
+            float oilSpec = pow(max(dot(N, H), 0.0), 56.0);
+            vec3 crudeBase = vec3(0.045, 0.042, 0.048) * (0.75 + 0.55 * hemi + 0.35 * ndl) * (0.92 + 0.02 * vShimmer);
+            col = crudeBase + mix(vec3(0.14, 0.10, 0.18), irid, 0.45) * (fresnel * 0.24 + oilSpec * 0.32);
+            col += vec3(0.68, 0.70, 0.76) * oilSpec * 0.55;
+            alpha = 0.97;
           } else if (vMatId > 2.5 && vMatId < 3.5) {
-            col += vec3(0.35, 0.92, 1.0) * (0.18 + fresnel * 0.6);
+            // CRYO: luminous cryogenic cyan liquid, semi-translucent with icy core glow
+            float pulse = 0.5 + 0.5 * sin(uTime * 3.5 + vShimmer * 0.9);
+            col = mix(vec3(0.14, 0.68, 0.88), vec3(0.56, 0.96, 1.0), 0.45 + 0.35 * fresnel + 0.15 * pulse);
+            col += vec3(0.75, 0.98, 1.0) * (0.14 + spec * 0.75);
+            alpha = clamp(0.78 + 0.18 * fresnel, 0.76, 0.96);
+          } else if (vMatId > 3.5 && vMatId < 4.5) {
+            // STEAM: soft translucent billowing vapor
+            col = mix(vec3(0.72, 0.80, 0.88), vec3(0.96, 0.98, 1.0), hemi);
+            alpha = clamp(0.42 + 0.18 * fresnel, 0.38, 0.64);
           } else if (vMatId > 4.5 && vMatId < 5.5) {
-            col = vColor * 1.25 + vec3(1.0, 0.85, 0.25) * fresnel * 0.5;
+            // FIRE: pure Noita-style quantized per-voxel combustion flicker (zero diagonal stripes!)
+            float stepTime = floor(uTime * 11.0);
+            float h = hash31(cellId + vec3(stepTime * 0.37, stepTime * 0.71, stepTime * 0.19));
+            float hNext = hash31(cellId + vec3((stepTime + 1.0) * 0.37, (stepTime + 1.0) * 0.71, (stepTime + 1.0) * 0.19));
+            float heat = mix(h, hNext, fract(uTime * 11.0) * 0.35);
+            vec3 crimsonTip = vec3(0.82, 0.12, 0.02);
+            vec3 orangeBody = vec3(1.0, 0.42, 0.04);
+            vec3 yellowCore = vec3(1.0, 0.93, 0.42);
+            col = heat < 0.45
+              ? mix(crimsonTip, orangeBody, heat / 0.45)
+              : mix(orangeBody, yellowCore, (heat - 0.45) / 0.55);
+            col *= 1.18 + 0.28 * fresnel;
+            alpha = clamp(0.84 + 0.12 * heat, 0.80, 0.96);
           } else if (vMatId > 5.5 && vMatId < 6.5) {
-            col += vec3(0.75, 0.95, 1.0) * fresnel * 0.7;
+            // Ballistic ICE shards: crisp crystalline translucency
+            col = mix(vec3(0.55, 0.88, 1.0), vec3(0.92, 0.99, 1.0), fresnel * 0.75) + vec3(0.9, 0.98, 1.0) * spec * 0.8;
+            alpha = clamp(0.72 + 0.24 * fresnel, 0.70, 0.96);
           } else if (vMatId > 10.5 && vMatId < 11.5) {
-            col += vec3(0.55, 1.0, 0.25) * (0.15 + fresnel * 0.5);
+            // ACID: toxic luminous green with bubbling surface highlights
+            float bub = hash31(cellId + floor(uTime * 6.0) * 0.23);
+            col = mix(vec3(0.24, 0.72, 0.08), vec3(0.72, 1.0, 0.24), 0.45 + 0.4 * bub + 0.25 * fresnel);
+            alpha = 0.86;
           }
 
           if (vElec > 0.5) {
-            float pulse = 0.65 + 0.35 * sin(uTime * 28.0 + vWorldPos.x * 12.0 + vWorldPos.z * 12.0);
-            col = mix(col, vec3(0.75, 0.96, 1.0), 0.55 * pulse);
+            // Pure electric blue + crisp arc-white surface crackles (zero yellow)
+            float eStep = floor(uTime * 16.0);
+            float eHash = hash31(cellId + vec3(eStep * 0.41, 1.7, eStep * 0.29));
+            float whiteArc = step(0.955, eHash);
+            float cyanFlick = step(0.89, eHash) * (1.0 - whiteArc);
+            col = mix(col, vec3(0.12, 0.46, 0.98), 0.28);
+            col += vec3(0.26, 0.72, 1.0) * fresnel * 0.42;
+            col = mix(col, vec3(0.55, 0.92, 1.0), cyanFlick * 0.65);
+            col = mix(col, vec3(0.95, 0.99, 1.0), whiteArc * 0.92);
+            alpha = max(alpha, 0.74 + whiteArc * 0.22);
           }
 
-          gl_FragColor = vec4(col, 1.0);
+          gl_FragColor = vec4(col, alpha);
         }
       `,
-      transparent: false,
+      transparent: true,
       depthWrite: true,
     });
 
     this.mesh = new THREE.Mesh(this.instGeo, material);
+    this.mesh.renderOrder = 2;
     this.mesh.frustumCulled = false;
     this.mesh.castShadow = false;
     this.mesh.receiveShadow = false;
     scene.add(this.mesh);
 
-    const vaporGeo = new THREE.BoxGeometry(0.14, 0.14, 0.14);
+    const vaporGeo = new THREE.BoxGeometry(0.13, 0.13, 0.13);
     const vaporMat = new THREE.MeshBasicMaterial({
-      color: 0xc8f6ff,
+      color: 0xcdf7ff,
       transparent: true,
-      opacity: 0.42,
+      opacity: 0.36,
       depthWrite: false,
     });
     this.vaporMesh = new THREE.InstancedMesh(vaporGeo, vaporMat, this.vaporMax);
+    this.vaporMesh.renderOrder = 5;
     this.vaporMesh.count = 0;
     this.vaporMesh.frustumCulled = false;
     scene.add(this.vaporMesh);
@@ -186,6 +250,19 @@ export class FluidRenderer {
     this.instGeo.instanceCount = 0;
     this.renderedGridCount = 0;
     this.renderedBallisticCount = 0;
+    this.vaporLife.fill(0);
+    this.vaporMesh.count = 0;
+  }
+
+  private spawnVaporWisp(x: number, y: number, z: number, life = 0.85): void {
+    const slot = this.vaporCursor;
+    this.vaporCursor = (this.vaporCursor + 1) % this.vaporMax;
+    const vb = slot * 3;
+    this.vaporPos[vb] = x;
+    this.vaporPos[vb + 1] = y;
+    this.vaporPos[vb + 2] = z;
+    this.vaporAge[slot] = 0;
+    this.vaporLife[slot] = life;
   }
 
   private chunkDistSq(cIdx: number, focusPos: THREE.Vector3): number {
@@ -214,7 +291,6 @@ export class FluidRenderer {
         live.push(c);
       }
     }
-    // Sort by ascending pool offset so write <= off holds strictly (zero overwrite corruption)
     live.sort((a, b) => this.chunkFluidOffset[a] - this.chunkFluidOffset[b]);
     let write = 0;
     for (let i = 0; i < live.length; i++) {
@@ -265,7 +341,6 @@ export class FluidRenderer {
           const mat = getMat(val);
           if (!isFluidOrGasMat(mat)) continue;
 
-          // 6-face same-fluid interior culling (§4.4)
           if (
             x > 0 &&
             x + 1 < W &&
@@ -300,7 +375,6 @@ export class FluidRenderer {
       return true;
     }
 
-    // Allocation strategy (§4.4): in-place -> append -> compact once -> drop farthest chunks
     if (count <= this.chunkFluidCap[cIdx]) {
       const off = this.chunkFluidOffset[cIdx];
       this.fluidCachePool.set(TEMP_CHUNK_BUF.subarray(0, count * 4), off * 4);
@@ -327,7 +401,6 @@ export class FluidRenderer {
       return true;
     }
 
-    // Drop farthest chunks until this closer chunk fits
     const targetDistSq = this.chunkDistSq(cIdx, focusPos);
     while (this.poolTail + count > MAX_RENDERED_GRID_FLUID) {
       let victim = -1;
@@ -340,9 +413,7 @@ export class FluidRenderer {
           victim = c;
         }
       }
-      if (victim === -1) {
-        return false;
-      }
+      if (victim === -1) return false;
       this.chunkFluidCount[victim] = 0;
       this.chunkFluidCap[victim] = 0;
       room.dirtyFluidRender[victim] = 1;
@@ -372,7 +443,6 @@ export class FluidRenderer {
         this.chunkDirtyAge[c] = 0;
         continue;
       }
-      // O(1) empty-chunk clear: never waste a rebuild slot scanning 4,096 empty cells
       if (room.chunkFluidVoxelCount[c] === 0) {
         this.chunkFluidCount[c] = 0;
         room.dirtyFluidRender[c] = 0;
@@ -384,7 +454,6 @@ export class FluidRenderer {
     }
 
     if (this.dirtySortBuf.length > 1) {
-      // Distance-prioritized with aging boost so farther moving puddles never starve mid-air
       this.dirtySortBuf.sort((a, b) => {
         const ageA = this.chunkDirtyAge[a];
         const ageB = this.chunkDirtyAge[b];
@@ -413,7 +482,6 @@ export class FluidRenderer {
     }
     this.lastRebuiltChunks = cleared;
 
-    // Pack visible cached grid fluid + active ballisticQuanta into 4-float GPU buffer
     let writeCount = 0;
     for (let c = 0; c < TOTAL_CHUNKS; c++) {
       const cnt = this.chunkFluidCount[c];
@@ -454,22 +522,41 @@ export class FluidRenderer {
     this.instGeo.instanceCount = writeCount;
     this.instanceAttr.needsUpdate = true;
 
-    // Update cosmetic cryo sublimation vapor wisps
+    // Update cosmetic cryo sublimation + ambient cold mist wisps
     const dt = this.lastTimeSec > 0 ? Math.min(0.05, Math.max(0, timeSec - this.lastTimeSec)) : 0.016;
     this.lastTimeSec = timeSec;
 
     for (let e = 0; e < room.sublimationEventCount; e++) {
-      const slot = this.vaporCursor;
-      this.vaporCursor = (this.vaporCursor + 1) % this.vaporMax;
       const eb = e * 3;
-      const vb = slot * 3;
-      this.vaporPos[vb] = room.sublimationEvents[eb];
-      this.vaporPos[vb + 1] = room.sublimationEvents[eb + 1] + 0.04;
-      this.vaporPos[vb + 2] = room.sublimationEvents[eb + 2];
-      this.vaporAge[slot] = 0;
-      this.vaporLife[slot] = 0.85;
+      this.spawnVaporWisp(
+        room.sublimationEvents[eb],
+        room.sublimationEvents[eb + 1] + 0.04,
+        room.sublimationEvents[eb + 2],
+        0.85,
+      );
     }
     room.sublimationEventCount = 0;
+
+    // Ambient low-lying cold mist rising gently from active exposed CRYO cells (~18 Hz)
+    const mistStep = Math.floor(timeSec * 18);
+    if (mistStep !== this.lastCryoMistStep && room.activeFluidCurCount > 0) {
+      this.lastCryoMistStep = mistStep;
+      const g = room.grid;
+      const af = room.activeFluidCur;
+      const cnt = room.activeFluidCurCount;
+      const stride = Math.max(1, Math.floor(cnt / 24));
+      let spawned = 0;
+      for (let i = mistStep % stride; i < cnt && spawned < 2; i += stride) {
+        const idx = af[i];
+        if (getMat(g[idx]) !== MAT.CRYO) continue;
+        const vy = Math.floor(idx / SLICE_STRIDE);
+        const rem = idx - vy * SLICE_STRIDE;
+        const vz = Math.floor(rem / ARENA_W);
+        const vx = rem - vz * ARENA_W;
+        this.spawnVaporWisp((vx + 0.5) * VOXEL_SIZE_M, (vy + 0.8) * VOXEL_SIZE_M, (vz + 0.5) * VOXEL_SIZE_M, 0.72);
+        spawned++;
+      }
+    }
 
     let activeVapor = 0;
     for (let i = 0; i < this.vaporMax; i++) {
@@ -481,11 +568,11 @@ export class FluidRenderer {
         continue;
       }
       const vb = i * 3;
-      this.vaporPos[vb + 1] += 0.9 * dt;
+      this.vaporPos[vb + 1] += 0.58 * dt;
       const t = this.vaporAge[i] / life;
-      const s = 0.7 + 1.4 * Math.sin(t * Math.PI);
+      const s = 0.6 + 1.3 * Math.sin(t * Math.PI);
       this.vaporPosVec.set(this.vaporPos[vb], this.vaporPos[vb + 1], this.vaporPos[vb + 2]);
-      this.vaporScaleVec.set(s, s * 1.15, s);
+      this.vaporScaleVec.set(s, s * 0.9, s);
       this.vaporMat4.compose(this.vaporPosVec, this.vaporQuat, this.vaporScaleVec);
       this.vaporMesh.setMatrixAt(activeVapor++, this.vaporMat4);
     }

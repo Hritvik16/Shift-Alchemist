@@ -42,8 +42,8 @@ import {
   tankBaffledTotalCapL,
   tankStarterCapL,
   tempCToByte,
-} from './balance.ts';
-import { hash32 } from './hash.ts';
+} from '../src/core/balance.ts';
+import { hash32 } from '../src/core/hash.ts';
 import {
   getDamage,
   getMat,
@@ -53,7 +53,7 @@ import {
   getTempByte,
   getTimerOrCharge,
   packVoxel,
-} from './types.ts';
+} from '../src/core/types.ts';
 
 describe('Master Constants & Balance Invariants (§2 / M1.1)', () => {
   it('enforces exact 16^3 chunk divisibility across arena and all 5 room templates', () => {

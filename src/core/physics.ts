@@ -1,5 +1,7 @@
 import {
+  ARMORED_RAW_DMG_MULT,
   DASH_GRACE_TICKS,
+  FLOATER_CRUSH_MULT,
   FIXED_DT,
   GRAVITY_ACCEL_BY_MODE,
   GRAVITY_MODE,
@@ -23,6 +25,7 @@ import {
   getTempByte,
   inRoomBounds,
   isSolidMat,
+  pushCombatEvent,
   type RoomState,
 } from './types.ts';
 import {
@@ -43,6 +46,8 @@ import {
   resolveEntityEntityCollisions,
   resolveStage8DeathsAndClear,
 } from './combat.ts';
+import { applyEntityStun, stepEnemyAIStage8 } from './ai.ts';
+import { stepElectricityStage7 } from './electricity.ts';
 import { applyDashVelocityIfActive, stepSuitActionsStage1 } from './suit.ts';
 
 export { computeWallSplatDamage };
@@ -231,10 +236,42 @@ function resolveSolidImpact(
   if (dashImmune || entity.impactIFrames > 0) return;
 
   const massKg = getEffectiveMassKg(entity, world.playerTank);
-  const dmg = computeWallSplatDamage(massKg, impactSpeed, entity.tempByte);
+  const brittle = entity.tempByte <= TEMP_BYTE.EMBRITTLED;
+  const mode = world.room.gravityMode;
+  const floaterCrush =
+    entity.locomotion === 'floater' &&
+    (mode === GRAVITY_MODE.G2 || mode === GRAVITY_MODE.G3 || mode === GRAVITY_MODE.GN1);
+  let dmg = computeWallSplatDamage(massKg, impactSpeed, entity.tempByte);
+  if (floaterCrush) {
+    // 2G/3G Crush or -1G Invert violently ruptures a Floater's gas bladder on deck/ceiling slam
+    dmg = Math.max(28, Math.round(dmg * FLOATER_CRUSH_MULT));
+  }
+  if (dmg > 0 && entity.carapace === 'armored' && !brittle) {
+    dmg = Math.max(1, Math.round(dmg * ARMORED_RAW_DMG_MULT));
+  }
+  if (dmg > 0 && isPlayer && world.hasAblativePlating) dmg = Math.max(1, Math.round(dmg * 0.7));
   if (dmg > 0) {
     entity.hp = Math.max(0, entity.hp - dmg);
     entity.impactIFrames = IMPACT_IFRAMES_TICKS;
+    if ((dmg >= 20 || floaterCrush) && entity.kind === 'alien') {
+      applyEntityStun(world.room, entity, floaterCrush ? 60 : 45, false, brittle || floaterCrush);
+    }
+    pushCombatEvent(world.room, {
+      kind: brittle ? 'shatter' : 'splat',
+      entityId: entity.id,
+      x: entity.x,
+      y: entity.y + entity.height,
+      z: entity.z,
+      value: dmg,
+      colorHex: brittle ? 0x7ef9ff : floaterCrush ? 0xffb347 : entity.carapace === 'armored' ? 0x9aa7b8 : 0xffbe55,
+      label: brittle
+        ? `3x SHATTER! -${dmg}`
+        : floaterCrush
+          ? `GRAV CRUSH! -${dmg}`
+          : entity.carapace === 'armored'
+            ? `ARMORED SPLAT -${dmg}`
+            : `SPLAT! -${dmg}`,
+    });
     if (isPlayer) {
       world.impactTelemetry.lastWallSplatDmg = dmg;
     }
@@ -253,9 +290,42 @@ export function integrateEntityVoxelPhysics(
   if (entity.impactIFrames > 0) entity.impactIFrames--;
   if (entity.impulseTimer > 0) entity.impulseTimer--;
 
-  // Apply gravity acceleration (suspended during active Jetpack Dash so horizontal dashes cross gaps cleanly)
+  // Apply gravity acceleration (suspended during Jetpack Dash; Floaters hover buoyantly in 1G but slam violently in 2G/3G/-1G)
   if (mode !== GRAVITY_MODE.G0 && !wasDashing) {
-    entity.vy += gAccel * FIXED_DT;
+    const floaterHover1G =
+      entity.locomotion === 'floater' &&
+      mode === GRAVITY_MODE.G1 &&
+      entity.stunTicks === 0 &&
+      entity.impulseTimer === 0;
+    if (floaterHover1G) {
+      const fvx = Math.max(1, Math.min(room.roomW - 2, Math.floor(entity.x / VOXEL_SIZE_M)));
+      const fvz = Math.max(1, Math.min(room.roomD - 2, Math.floor(entity.z / VOXEL_SIZE_M)));
+      let floorY = 0.2;
+      const startVY = Math.max(1, Math.min(room.roomH - 2, Math.floor((entity.y + 0.1) / VOXEL_SIZE_M)));
+      for (let vy = startVY; vy >= 0; vy--) {
+        if (isSolidMat(getMat(room.grid[cellIndex(fvx, vy, fvz)]))) {
+          floorY = (vy + 1) * VOXEL_SIZE_M;
+          break;
+        }
+      }
+      let ceilY = (room.roomH - 2) * VOXEL_SIZE_M;
+      for (let vy = startVY + 1; vy < room.roomH; vy++) {
+        if (isSolidMat(getMat(room.grid[cellIndex(fvx, vy, fvz)]))) {
+          ceilY = vy * VOXEL_SIZE_M;
+          break;
+        }
+      }
+      const targetHoverY = Math.min(floorY + 1.65, ceilY - entity.height - 0.25);
+      const errY = targetHoverY - entity.y;
+      entity.vy += Math.max(-16, Math.min(16, errY * 14.0)) * FIXED_DT;
+      entity.vy *= 0.88;
+    } else if (entity.locomotion === 'floater' && (mode === GRAVITY_MODE.G2 || mode === GRAVITY_MODE.G3)) {
+      // Heavy gravity crushes the gas bladder downward rapidly so every Crush hits > WALL_SPLAT_V_MIN
+      entity.vy += gAccel * 1.35 * FIXED_DT;
+      entity.impulseTimer = IMPULSE_TIMER_TICKS;
+    } else {
+      entity.vy += gAccel * FIXED_DT;
+    }
   }
   if (entity.kind === 'crate') {
     applyCrateBuoyancy(world, entity);
@@ -483,7 +553,7 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
       const vAccel = 16.0 * FIXED_DT;
       player.vy += Math.max(-vAccel, Math.min(vAccel, targetVy - player.vy));
     } else {
-      const blend = player.grounded ? 0.45 : 0.18;
+      const blend = player.grounded ? (ilen > 0 ? 0.78 : 0.72) : 0.22;
       player.vx += (ix * speed - player.vx) * blend;
       player.vz += (iz * speed - player.vz) * blend;
     }
@@ -526,8 +596,12 @@ export function stepWorldTick(world: WorldState, input: InputFrame): void {
   // Stage 6: Coalesced Phase Explosions
   stepPhaseExplosionsStage6(world);
 
+  // Stage 7: Fair Round-Robin Electrical BFS Pulses & 60 Hz Charge Decay
+  stepElectricityStage7(world);
+
   // Stage 8: Entity fluid sampling/DOTs, deferred retries, overflow scanners, deaths/clear & bit-22 cleanup
   stepEntityFluidSamplingStage8(world);
+  stepEnemyAIStage8(world);
   stepFluidStage8(world);
   resolveStage8DeathsAndClear(world);
 }

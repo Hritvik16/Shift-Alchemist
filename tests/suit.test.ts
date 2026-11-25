@@ -19,17 +19,17 @@ import {
   TEMP_BYTE,
   siphonRateLPerTick,
   tankStarterCapL,
-} from './balance.ts';
-import { spawnBallistic } from './fluids.ts';
-import { stepWorldTick } from './physics.ts';
-import { generateCargoHold } from './roomGen.ts';
+} from '../src/core/balance.ts';
+import { spawnBallistic } from '../src/core/fluids.ts';
+import { stepWorldTick } from '../src/core/physics.ts';
+import { generateCargoHold } from '../src/core/roomGen.ts';
 import {
   BALLISTIC_FLAG,
   carveSphereDebug,
   packVoxel,
   recomputeRoomLedgers,
   writeCell,
-} from './types.ts';
+} from '../src/core/types.ts';
 import {
   createEmptyInput,
   createWorldState,
@@ -37,7 +37,7 @@ import {
   getEffectiveMassKg,
   setTankCapRank,
   type WorldState,
-} from './world.ts';
+} from '../src/core/world.ts';
 
 function makeCargoWorld(seed = 3101): WorldState {
   const world = createWorldState(seed);

@@ -23,6 +23,16 @@ export const SOLID_BUCKET = {
 
 export type SolidBucketId = (typeof SOLID_BUCKET)[keyof typeof SOLID_BUCKET];
 
+// Viewer-only architectural material codes (all opaque except 101/102 glass)
+const CODE_DIORAMA_CAP = 20;
+const CODE_HAZARD_LEDGE = 21;
+const CODE_WALL_STRIPE = 22;
+const CODE_PIT_STEEL = 23;
+const CODE_STAIR_STEEL = 24;
+const CODE_UPPER_STEEL = 25;
+const CODE_WALL_DARK = 26;
+const CODE_WALL_PANEL = 27;
+
 interface BucketAccumulator {
   positions: number[];
   normals: number[];
@@ -51,35 +61,109 @@ const bucketAccs: [BucketAccumulator, BucketAccumulator, BucketAccumulator] = [
   createAcc(),
 ];
 
+// Stronger baked voxel AO curve for crisp wall/floor creases, stair risers & scaffold bases
+const AO_CURVE = [0.42, 0.62, 0.82, 1.0] as const;
+
 function isViewerCeilingCutaway(room: RoomState, y: number): boolean {
   return y >= room.roomH - 2;
 }
 
-function isSouthEastUpperCutaway(room: RoomState, x: number, y: number, z: number): boolean {
-  return (x === room.roomW - 1 || z === room.roomD - 1) && y >= 8 && y < room.roomH - 2;
+function getSouthEastCurbTopY(room: RoomState, x: number, z: number): number {
+  const defaultTop = room.roomH >= 64 ? 14 : 5;
+  const isS = z === room.roomD - 1;
+  const isE = x === room.roomW - 1;
+  for (let i = 0; i < room.doors.length; i++) {
+    const d = room.doors[i];
+    if (isS && d.face === 'S' && x >= d.minX && x <= d.maxX) return 4;
+    if (isE && d.face === 'E' && z >= d.minZ && z <= d.maxZ) return 4;
+  }
+  return defaultTop;
+}
+
+function isCellSolidRaw(room: RoomState, x: number, y: number, z: number): boolean {
+  if (!inRoomBounds(room, x, y, z)) return false;
+  return isSolidMat(getMat(room.grid[cellIndex(x, y, z)]));
+}
+
+function isHullDropLedge(room: RoomState, x: number, y: number, z: number): boolean {
+  if (y < 4) return false;
+  if (isCellSolidRaw(room, x, y + 1, z)) return false;
+  // Require a >= 0.3 m (3-voxel) drop on a cardinal neighbor so 0.2 m stairs stay distinct from pit/chasm ledges
+  const checkDrop = (nx: number, nz: number): boolean =>
+    inRoomBounds(room, nx, y - 2, nz) &&
+    !isCellSolidRaw(room, nx, y, nz) &&
+    !isCellSolidRaw(room, nx, y - 1, nz) &&
+    !isCellSolidRaw(room, nx, y - 2, nz);
+  return (
+    checkDrop(x + 1, z) ||
+    checkDrop(x - 1, z) ||
+    checkDrop(x, z + 1) ||
+    checkDrop(x, z - 1)
+  );
+}
+
+function isHullStairStep(room: RoomState, x: number, y: number, z: number): boolean {
+  if (y < 2 || room.roomH < 64) return false;
+  if (isCellSolidRaw(room, x, y + 1, z)) return false;
+  if (y >= 2 && y <= 10) {
+    const checkStep = (nx: number, nz: number): boolean =>
+      inRoomBounds(room, nx, y - 2, nz) &&
+      !isCellSolidRaw(room, nx, y, nz) &&
+      !isCellSolidRaw(room, nx, y - 1, nz) &&
+      isCellSolidRaw(room, nx, y - 2, nz);
+    return (
+      checkStep(x + 1, z) ||
+      checkStep(x - 1, z) ||
+      checkStep(x, z + 1) ||
+      checkStep(x, z - 1)
+    );
+  }
+  return false;
 }
 
 function classifyCell(room: RoomState, x: number, y: number, z: number): number {
   if (!inRoomBounds(room, x, y, z)) return 0;
   if (isViewerCeilingCutaway(room, y)) return 0;
+
+  // Clean diorama cutaway: completely cull South/East walls above knee-height curb (zero milky foreground walls!)
+  if (x === room.roomW - 1 || z === room.roomD - 1) {
+    const curbTop = getSouthEastCurbTopY(room, x, z);
+    if (y > curbTop) return 0;
+    if (y === curbTop) return CODE_DIORAMA_CAP;
+  }
+
   const val = room.grid[cellIndex(x, y, z)];
   const mat = getMat(val);
   if (!isSolidMat(mat)) return 0;
 
-  if (isSouthEastUpperCutaway(room, x, y, z)) {
-    // Pack into transparent bucket with special cutaway tag (code 100)
-    return 100;
-  }
   if (mat === MAT.GLASS_VAT) {
-    // Distinguish CRYO-chilled vat glass (code 101) from ambient glass (code 102)
     return getTempByte(val) <= TEMP_BYTE.EMBRITTLED ? 101 : 102;
   }
+
+  if (mat === MAT.BOUNDARY_HULL) {
+    if (y === 0) return CODE_WALL_DARK;
+    const floorBase = room.roomH >= 64 ? 12 : 2;
+    if (y <= floorBase + 5 || y >= room.roomH - 8) return CODE_WALL_DARK;
+    if (y === floorBase + 6 || y === floorBase + 7) return CODE_WALL_STRIPE;
+    const along = x === 0 ? z : x;
+    if (along % 32 < 3) return CODE_WALL_DARK;
+    return CODE_WALL_PANEL;
+  }
+
+  if (mat === MAT.HULL_STEEL) {
+    if (isHullDropLedge(room, x, y, z)) return CODE_HAZARD_LEDGE;
+    if (isHullStairStep(room, x, y, z)) return CODE_STAIR_STEEL;
+    if (room.roomH >= 64 && y <= 2) return CODE_PIT_STEEL;
+    if (y >= 16) return CODE_UPPER_STEEL;
+    return MAT.HULL_STEEL;
+  }
+
   return mat;
 }
 
 function codeBucket(code: number): SolidBucketId {
   if (code === MAT.STEEL_GRATE) return SOLID_BUCKET.GRATE;
-  if (code === MAT.ICE || code === 100 || code === 101 || code === 102) {
+  if (code === MAT.ICE || code === 101 || code === 102) {
     return SOLID_BUCKET.TRANSPARENT;
   }
   return SOLID_BUCKET.OPAQUE;
@@ -89,11 +173,42 @@ function isOpaqueCode(code: number): boolean {
   return code !== 0 && codeBucket(code) === SOLID_BUCKET.OPAQUE;
 }
 
+function isAoOccluder(room: RoomState, x: number, y: number, z: number): number {
+  return isOpaqueCode(classifyCell(room, x, y, z)) ? 1 : 0;
+}
+
+function computeCornerAo(
+  room: RoomState,
+  nx: number,
+  ny: number,
+  nz: number,
+  dux: number,
+  duy: number,
+  duz: number,
+  dvx: number,
+  dvy: number,
+  dvz: number,
+): number {
+  const s1 = isAoOccluder(room, nx + dux, ny + duy, nz + duz);
+  const s2 = isAoOccluder(room, nx + dvx, ny + dvy, nz + dvz);
+  if (s1 && s2) return 0;
+  const c = isAoOccluder(room, nx + dux + dvx, ny + duy + dvy, nz + duz + dvz);
+  return 3 - (s1 + s2 + c);
+}
+
 function codeRGBA(code: number): [number, number, number, number] {
-  if (code === 100) return [0.32, 0.38, 0.48, 0.15]; // South/East bulkhead 0.15 opacity (§5)
   if (code === 101) return [0.55, 0.96, 1.0, 0.34]; // CRYO vat frosted glass
   if (code === 102) return [0.65, 0.94, 0.88, 0.28]; // Ambient vat glass
   if (code === MAT.ICE) return [0.6, 0.91, 1.0, 0.78];
+
+  if (code === CODE_DIORAMA_CAP) return [0.09, 0.12, 0.18, 1.0];
+  if (code === CODE_HAZARD_LEDGE) return [0.92, 0.72, 0.14, 1.0]; // AO-invariant ratio r/b > 3.6 -> caution stripes
+  if (code === CODE_WALL_STRIPE) return [0.18, 0.38, 0.46, 1.0];
+  if (code === CODE_PIT_STEEL) return [0.17, 0.21, 0.28, 1.0];
+  if (code === CODE_STAIR_STEEL) return [0.38, 0.44, 0.54, 1.0];
+  if (code === CODE_UPPER_STEEL) return [0.39, 0.46, 0.57, 1.0];
+  if (code === CODE_WALL_DARK) return [0.16, 0.20, 0.27, 1.0];
+  if (code === CODE_WALL_PANEL) return [0.24, 0.29, 0.37, 1.0];
 
   const hex = MATERIAL_SPEC[code]?.colorHex ?? 0x808080;
   return [((hex >> 16) & 255) / 255, ((hex >> 8) & 255) / 255, (hex & 255) / 255, 1.0];
@@ -121,6 +236,10 @@ function emitQuad(
   g: number,
   b: number,
   a: number,
+  ao0: number,
+  ao1: number,
+  ao2: number,
+  ao3: number,
   flipWinding: boolean,
 ): void {
   const base = acc.vertexCount;
@@ -131,16 +250,41 @@ function emitQuad(
     x3 * VOXEL_SIZE_M, y3 * VOXEL_SIZE_M, z3 * VOXEL_SIZE_M,
   );
   acc.normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz, nx, ny, nz);
+
+  const l0 = AO_CURVE[ao0];
+  const l1 = AO_CURVE[ao1];
+  const l2 = AO_CURVE[ao2];
+  const l3 = AO_CURVE[ao3];
+
   if (hasAlpha) {
-    acc.colors.push(r, g, b, a, r, g, b, a, r, g, b, a, r, g, b, a);
+    acc.colors.push(
+      r * l0, g * l0, b * l0, a,
+      r * l1, g * l1, b * l1, a,
+      r * l2, g * l2, b * l2, a,
+      r * l3, g * l3, b * l3, a,
+    );
   } else {
-    acc.colors.push(r, g, b, r, g, b, r, g, b, r, g, b);
+    acc.colors.push(
+      r * l0, g * l0, b * l0,
+      r * l1, g * l1, b * l1,
+      r * l2, g * l2, b * l2,
+      r * l3, g * l3, b * l3,
+    );
   }
 
+  const flipDiag = ao1 + ao3 > ao0 + ao2;
   if (flipWinding) {
-    acc.indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+    if (flipDiag) {
+      acc.indices.push(base, base + 3, base + 1, base + 1, base + 3, base + 2);
+    } else {
+      acc.indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+    }
   } else {
-    acc.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    if (flipDiag) {
+      acc.indices.push(base, base + 1, base + 3, base + 1, base + 2, base + 3);
+    } else {
+      acc.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
   }
   acc.vertexCount += 4;
 }
@@ -153,7 +297,8 @@ export interface ChunkMeshResult {
 
 /**
  * Greedy meshes a single 16^3 chunk in chunk-local meters [0..1.6]
- * into the 3 canonical solid BatchedMesh buckets (ignoring damage bits).
+ * into the 3 canonical solid BatchedMesh buckets with baked 4-corner Voxel AO
+ * and automatic elevation/ledge architectural styling.
  */
 export function buildChunkSolidMeshes(
   room: RoomState,
@@ -173,10 +318,15 @@ export function buildChunkSolidMeshes(
   const xLocal = [0, 0, 0];
   const q = [0, 0, 0];
 
-  // Sweep 3 axes, 2 directions (+1 and -1) per axis
   for (let d = 0; d < 3; d++) {
     const u = (d + 1) % 3;
     const v = (d + 2) % 3;
+    const euX = u === 0 ? 1 : 0;
+    const euY = u === 1 ? 1 : 0;
+    const euZ = u === 2 ? 1 : 0;
+    const evX = v === 0 ? 1 : 0;
+    const evY = v === 1 ? 1 : 0;
+    const evZ = v === 2 ? 1 : 0;
 
     for (let dirSign = 1; dirSign >= -1; dirSign -= 2) {
       q[0] = 0;
@@ -185,7 +335,6 @@ export function buildChunkSolidMeshes(
       q[d] = dirSign;
 
       for (let slice = 0; slice < dims[d]; slice++) {
-        // Fill 16x16 face visibility mask
         let n = 0;
         let hasAny = false;
         xLocal[d] = slice;
@@ -202,9 +351,11 @@ export function buildChunkSolidMeshes(
               maskScratch[n++] = 0;
               continue;
             }
-            const bCode = classifyCell(room, wx + q[0], wy + q[1], wz + q[2]);
+            const nx = wx + q[0];
+            const ny = wy + q[1];
+            const nz = wz + q[2];
+            const bCode = classifyCell(room, nx, ny, nz);
 
-            // Face is visible if neighbor doesn't occlude it
             let visible = false;
             if (bCode === 0) {
               visible = true;
@@ -215,7 +366,15 @@ export function buildChunkSolidMeshes(
             }
 
             if (visible) {
-              maskScratch[n++] = aCode;
+              let aoBits = 0xff;
+              if (codeBucket(aCode) !== SOLID_BUCKET.TRANSPARENT) {
+                const ao0 = computeCornerAo(room, nx, ny, nz, -euX, -euY, -euZ, -evX, -evY, -evZ);
+                const ao1 = computeCornerAo(room, nx, ny, nz, euX, euY, euZ, -evX, -evY, -evZ);
+                const ao2 = computeCornerAo(room, nx, ny, nz, euX, euY, euZ, evX, evY, evZ);
+                const ao3 = computeCornerAo(room, nx, ny, nz, -euX, -euY, -euZ, evX, evY, evZ);
+                aoBits = ao0 | (ao1 << 2) | (ao2 << 4) | (ao3 << 6);
+              }
+              maskScratch[n++] = (aCode << 8) | aoBits;
               hasAny = true;
             } else {
               maskScratch[n++] = 0;
@@ -225,41 +384,51 @@ export function buildChunkSolidMeshes(
 
         if (!hasAny) continue;
 
-        // Greedy rectangle merge across the 16x16 mask
         n = 0;
         for (let j = 0; j < dims[v]; j++) {
           for (let i = 0; i < dims[u]; ) {
-            const code = maskScratch[n];
-            if (code === 0) {
+            const key = maskScratch[n];
+            if (key === 0) {
               i++;
               n++;
               continue;
             }
 
-            let w = 1;
-            while (i + w < dims[u] && maskScratch[n + w] === code) w++;
+            const code = key >>> 8;
+            const ao0 = key & 3;
+            const ao1 = (key >>> 2) & 3;
+            const ao2 = (key >>> 4) & 3;
+            const ao3 = (key >>> 6) & 3;
 
-            let h = 1;
-            let done = false;
-            while (j + h < dims[v]) {
-              for (let k = 0; k < w; k++) {
-                if (maskScratch[n + k + h * dims[u]] !== code) {
-                  done = true;
-                  break;
-                }
-              }
-              if (done) break;
-              h++;
+            const canMergeU = ao0 === ao1 && ao3 === ao2;
+            const canMergeV = ao0 === ao3 && ao1 === ao2;
+
+            let w = 1;
+            if (canMergeU) {
+              while (i + w < dims[u] && maskScratch[n + w] === key) w++;
             }
 
-            // Clear merged region
+            let h = 1;
+            if (canMergeV) {
+              let done = false;
+              while (j + h < dims[v]) {
+                for (let k = 0; k < w; k++) {
+                  if (maskScratch[n + k + h * dims[u]] !== key) {
+                    done = true;
+                    break;
+                  }
+                }
+                if (done) break;
+                h++;
+              }
+            }
+
             for (let l = 0; l < h; l++) {
               for (let k = 0; k < w; k++) {
                 maskScratch[n + k + l * dims[u]] = 0;
               }
             }
 
-            // Emit quad in chunk-local voxel coordinates
             const p = [0, 0, 0];
             p[d] = dirSign > 0 ? slice + 1 : slice;
             p[u] = i;
@@ -275,7 +444,6 @@ export function buildChunkSolidMeshes(
             const [r, g, b, a] = codeRGBA(code);
             const hasAlpha = bucket === SOLID_BUCKET.TRANSPARENT;
 
-            // Right-handed outward winding: (u x v) == +d for cyclic (d, u, v)
             emitQuad(
               acc,
               hasAlpha,
@@ -285,6 +453,7 @@ export function buildChunkSolidMeshes(
               p[0] + dv[0], p[1] + dv[1], p[2] + dv[2],
               q[0], q[1], q[2],
               r, g, b, a,
+              ao0, ao1, ao2, ao3,
               dirSign < 0,
             );
 

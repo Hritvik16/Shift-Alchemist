@@ -10,9 +10,9 @@ import {
   MAT,
   SCRAP_DROPS,
   TEMP_BYTE,
-} from './balance.ts';
-import { stepWorldTick } from './physics.ts';
-import { generateCargoHold, populateCargoHoldEntities } from './roomGen.ts';
+} from '../src/core/balance.ts';
+import { stepWorldTick } from '../src/core/physics.ts';
+import { generateCargoHold, populateCargoHoldEntities } from '../src/core/roomGen.ts';
 import {
   cellIndex,
   getDamage,
@@ -20,7 +20,7 @@ import {
   packVoxel,
   recomputeRoomLedgers,
   writeCell,
-} from './types.ts';
+} from '../src/core/types.ts';
 import {
   createBroodPodEntity,
   createCrateEntity,
@@ -28,7 +28,7 @@ import {
   createWorldState,
   type LockOnTarget,
   type WorldState,
-} from './world.ts';
+} from '../src/core/world.ts';
 
 function makePopulatedWorld(seed = 1301): WorldState {
   const world = createWorldState(seed);

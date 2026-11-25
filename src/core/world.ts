@@ -1,5 +1,17 @@
 import {
+  BRUISER_D_M,
+  BRUISER_DRY_MASS_KG,
+  BRUISER_GLAND_CAP_L,
+  BRUISER_H_M,
+  BRUISER_MAX_HP,
+  BRUISER_W_M,
   CRATE_DRY_MASS_KG,
+  FLOATER_D_M,
+  FLOATER_DRY_MASS_KG,
+  FLOATER_GLAND_CAP_L,
+  FLOATER_HEIGHT_M,
+  FLOATER_MAX_HP,
+  FLOATER_W_M,
   CRATE_MAX_HP,
   CRATE_SIZE_M,
   GRAV_CRUSH_S,
@@ -17,15 +29,30 @@ import {
   POD_DRY_MASS_KG,
   POD_H_M,
   POD_MAX_HP,
+  NOZZLE_MODE,
   POD_W_M,
+  SKITTERER_D_M,
+  SKITTERER_DRY_MASS_KG,
+  SKITTERER_GLAND_CAP_L,
+  SKITTERER_H_M,
+  SKITTERER_MAX_HP,
+  SKITTERER_W_M,
+  SPITTER_D_M,
+  SPITTER_DRY_MASS_KG,
+  SPITTER_GLAND_CAP_L,
+  SPITTER_H_M,
+  SPITTER_MAX_HP,
+  SPITTER_W_M,
   TEMP_BYTE,
   gravCooldownS,
   tankBaffledChamberCapL,
   tankStarterCapL,
   type GravityMode,
   type MaterialId,
+  type NozzleMode,
 } from './balance.ts';
-import { createEmptyRoomState, type ConservationLedgers, type RoomState } from './types.ts';
+import type { DeckGraph } from './deckGen.ts';
+import { createEmptyRoomState, type ConservationLedgers, type DoorRecord, type RoomState } from './types.ts';
 
 export interface GlandState {
   mat: MaterialId;
@@ -55,6 +82,7 @@ export interface Entity {
   chargeUnits: number;
   burnTicks: number;
   wetTicks: number;
+  shockTicks: number;
   stunTicks: number;
   stunImmunityTicks: number;
   dashTimer: number;
@@ -62,12 +90,20 @@ export interface Entity {
   impactIFrames: number;
   impulseTimer: number;
   reflectCooldown: number;
-  locomotion: 'humanoid' | 'skitterer' | 'floater' | 'crusher' | 'boss' | 'prop' | 'pod';
+  locomotion: 'humanoid' | 'skitterer' | 'spitter' | 'floater' | 'crusher' | 'boss' | 'prop' | 'pod';
   glands: GlandState[];
-  carapace: 'none' | 'thermal' | 'insulated' | 'spined';
+  carapace: 'none' | 'thermal' | 'insulated' | 'spined' | 'armored';
   deathHusk: boolean;
   grounded: boolean;
   bioCache: boolean;
+  aiState: 'idle' | 'chase' | 'telegraph' | 'lunge' | 'recover';
+  aiTimer: number;
+  aiAttackKind: 'none' | 'melee' | 'spit';
+  attackCdTicks: number;
+  telegraphDirX: number;
+  telegraphDirY: number;
+  telegraphDirZ: number;
+  meleeHitDone: boolean;
 }
 
 export interface TankChamberState {
@@ -106,6 +142,7 @@ export interface SuitActionState {
   nozzleTapBurstShotsLeft: number;
   nozzleTapSpacingTicks: number;
   nozzleTapWaitTicks: number;
+  nozzleMode: NozzleMode;
   nozzleTapCdTicks: number;
   nozzleHoseActive: boolean;
   airBurstCdTicks: number;
@@ -124,6 +161,8 @@ export interface SuitActionState {
   siphonTargetY: number;
   siphonTargetZ: number;
   siphonLitersThisTick: number;
+  piezoArcCdTicks: number;
+  streamShockCdTicks: number;
 }
 
 export interface InputFrame {
@@ -145,6 +184,8 @@ export interface InputFrame {
   siphonHeld: boolean; // Right-Click
   pressDash: boolean; // Space (edge-triggered)
   pressInteract: boolean; // F (edge-triggered)
+  pressSwapChamber: boolean; // R (edge-triggered)
+  pressCycleNozzle: boolean; // Tab (edge-triggered)
 }
 
 export interface ImpactTelemetry {
@@ -157,11 +198,23 @@ export interface ImpactTelemetry {
 export interface WorldState {
   runSeed: number;
   simTick: number;
+  deck: DeckGraph | null;
+  currentRoomId: number;
+  nearbyDoor: DoorRecord | null;
+  pendingAirlock: DoorRecord | null;
   tankCapRank: number;
   siphonRank: number;
   nozzlePressureRank: number;
   gravCdRank: number;
+  fuseRank: number;
+  liningRank: number;
+  hasSparkPlug: boolean;
+  hasPiezoArc: boolean;
+  hasCryoNozzle: boolean;
   has3GOverdrive: boolean;
+  hasGyroStabilizer: boolean;
+  hasAblativePlating: boolean;
+  nearbyTerminalIndex: number | null;
   scrap: number;
   kills: number;
   podsTotal: number;
@@ -203,6 +256,8 @@ export function createEmptyInput(): InputFrame {
     siphonHeld: false,
     pressDash: false,
     pressInteract: false,
+    pressSwapChamber: false,
+    pressCycleNozzle: false,
   };
 }
 
@@ -227,6 +282,7 @@ export function createPlayerEntity(spawnX = 12.0, spawnY = 0.2, spawnZ = 1.0): E
     chargeUnits: 0,
     burnTicks: 0,
     wetTicks: 0,
+    shockTicks: 0,
     stunTicks: 0,
     stunImmunityTicks: 0,
     dashTimer: 0,
@@ -240,6 +296,14 @@ export function createPlayerEntity(spawnX = 12.0, spawnY = 0.2, spawnZ = 1.0): E
     deathHusk: false,
     grounded: false,
     bioCache: false,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 30,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
   };
 }
 
@@ -270,6 +334,7 @@ export function createCrateEntity(
     chargeUnits: 0,
     burnTicks: 0,
     wetTicks: 0,
+    shockTicks: 0,
     stunTicks: 0,
     stunImmunityTicks: 0,
     dashTimer: 0,
@@ -283,6 +348,14 @@ export function createCrateEntity(
     deathHusk: false,
     grounded: true,
     bioCache,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 30,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
   };
 }
 
@@ -312,6 +385,7 @@ export function createBroodPodEntity(
     chargeUnits: 0,
     burnTicks: 0,
     wetTicks: 0,
+    shockTicks: 0,
     stunTicks: 0,
     stunImmunityTicks: 0,
     dashTimer: 0,
@@ -325,6 +399,258 @@ export function createBroodPodEntity(
     deathHusk: false,
     grounded: true,
     bioCache: false,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 30,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
+  };
+}
+
+export function createSkittererEntity(
+  id: number,
+  x: number,
+  y: number,
+  z: number,
+  glandMat: MaterialId = MAT.OIL,
+): Entity {
+  const glandTemp = glandMat === MAT.CRYO ? TEMP_BYTE.CRYO : TEMP_BYTE.AMBIENT;
+  return {
+    id,
+    kind: 'alien',
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    halfW: SKITTERER_W_M * 0.5,
+    height: SKITTERER_H_M,
+    halfD: SKITTERER_D_M * 0.5,
+    upSign: 1,
+    dryMassKg: SKITTERER_DRY_MASS_KG,
+    hp: SKITTERER_MAX_HP,
+    maxHp: SKITTERER_MAX_HP,
+    tempByte: TEMP_BYTE.AMBIENT,
+    chargeUnits: 0,
+    burnTicks: 0,
+    wetTicks: 0,
+    shockTicks: 0,
+    stunTicks: 0,
+    stunImmunityTicks: 0,
+    dashTimer: 0,
+    dashGraceTimer: 0,
+    impactIFrames: 0,
+    impulseTimer: 0,
+    reflectCooldown: 0,
+    locomotion: 'skitterer',
+    glands: [
+      {
+        mat: glandMat,
+        liters: SKITTERER_GLAND_CAP_L,
+        capL: SKITTERER_GLAND_CAP_L,
+        tempByte: glandTemp,
+        chargeUnits: 0,
+      },
+    ],
+    carapace: 'none',
+    deathHusk: false,
+    grounded: true,
+    bioCache: false,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 35,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
+  };
+}
+
+export function createBruiserEntity(
+  id: number,
+  x: number,
+  y: number,
+  z: number,
+  glandMat: MaterialId = MAT.OIL,
+): Entity {
+  const glandTemp = glandMat === MAT.CRYO ? TEMP_BYTE.CRYO : TEMP_BYTE.AMBIENT;
+  return {
+    id,
+    kind: 'alien',
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    halfW: BRUISER_W_M * 0.5,
+    height: BRUISER_H_M,
+    halfD: BRUISER_D_M * 0.5,
+    upSign: 1,
+    dryMassKg: BRUISER_DRY_MASS_KG,
+    hp: BRUISER_MAX_HP,
+    maxHp: BRUISER_MAX_HP,
+    tempByte: TEMP_BYTE.AMBIENT,
+    chargeUnits: 0,
+    burnTicks: 0,
+    wetTicks: 0,
+    shockTicks: 0,
+    stunTicks: 0,
+    stunImmunityTicks: 0,
+    dashTimer: 0,
+    dashGraceTimer: 0,
+    impactIFrames: 0,
+    impulseTimer: 0,
+    reflectCooldown: 0,
+    locomotion: 'crusher',
+    glands: [
+      {
+        mat: glandMat,
+        liters: BRUISER_GLAND_CAP_L,
+        capL: BRUISER_GLAND_CAP_L,
+        tempByte: glandTemp,
+        chargeUnits: 0,
+      },
+    ],
+    carapace: 'armored',
+    deathHusk: false,
+    grounded: true,
+    bioCache: false,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 50,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
+  };
+}
+
+export function createSpitterEntity(
+  id: number,
+  x: number,
+  y: number,
+  z: number,
+  glandMat: MaterialId = MAT.OIL,
+): Entity {
+  const glandTemp = glandMat === MAT.CRYO ? TEMP_BYTE.CRYO : TEMP_BYTE.AMBIENT;
+  return {
+    id,
+    kind: 'alien',
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    halfW: SPITTER_W_M * 0.5,
+    height: SPITTER_H_M,
+    halfD: SPITTER_D_M * 0.5,
+    upSign: 1,
+    dryMassKg: SPITTER_DRY_MASS_KG,
+    hp: SPITTER_MAX_HP,
+    maxHp: SPITTER_MAX_HP,
+    tempByte: TEMP_BYTE.AMBIENT,
+    chargeUnits: 0,
+    burnTicks: 0,
+    wetTicks: 0,
+    shockTicks: 0,
+    stunTicks: 0,
+    stunImmunityTicks: 0,
+    dashTimer: 0,
+    dashGraceTimer: 0,
+    impactIFrames: 0,
+    impulseTimer: 0,
+    reflectCooldown: 0,
+    locomotion: 'spitter',
+    glands: [
+      {
+        mat: glandMat,
+        liters: SPITTER_GLAND_CAP_L,
+        capL: SPITTER_GLAND_CAP_L,
+        tempByte: glandTemp,
+        chargeUnits: 0,
+      },
+    ],
+    carapace: 'none',
+    deathHusk: false,
+    grounded: true,
+    bioCache: false,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 40,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
+  };
+}
+
+export function createFloaterEntity(
+  id: number,
+  x: number,
+  y: number,
+  z: number,
+  glandMat: MaterialId = MAT.OIL,
+): Entity {
+  const glandTemp = glandMat === MAT.CRYO ? TEMP_BYTE.CRYO : TEMP_BYTE.AMBIENT;
+  return {
+    id,
+    kind: 'alien',
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    halfW: FLOATER_W_M * 0.5,
+    height: FLOATER_HEIGHT_M,
+    halfD: FLOATER_D_M * 0.5,
+    upSign: 1,
+    dryMassKg: FLOATER_DRY_MASS_KG,
+    hp: FLOATER_MAX_HP,
+    maxHp: FLOATER_MAX_HP,
+    tempByte: TEMP_BYTE.AMBIENT,
+    chargeUnits: 0,
+    burnTicks: 0,
+    wetTicks: 0,
+    shockTicks: 0,
+    stunTicks: 0,
+    stunImmunityTicks: 0,
+    dashTimer: 0,
+    dashGraceTimer: 0,
+    impactIFrames: 0,
+    impulseTimer: 0,
+    reflectCooldown: 0,
+    locomotion: 'floater',
+    glands: [
+      {
+        mat: glandMat,
+        liters: FLOATER_GLAND_CAP_L,
+        capL: FLOATER_GLAND_CAP_L,
+        tempByte: glandTemp,
+        chargeUnits: 0,
+      },
+    ],
+    carapace: 'none',
+    deathHusk: false,
+    grounded: false,
+    bioCache: false,
+    aiState: 'idle',
+    aiTimer: 0,
+    aiAttackKind: 'none',
+    attackCdTicks: 45,
+    telegraphDirX: 0,
+    telegraphDirY: 0,
+    telegraphDirZ: 1,
+    meleeHitDone: false,
   };
 }
 
@@ -355,6 +681,7 @@ export function createStarterTank(tankCapRank = 0): PlayerTankState {
 
 export function createSuitActionState(): SuitActionState {
   return {
+    nozzleMode: NOZZLE_MODE.STREAM,
     nozzleTapBurstShotsLeft: 0,
     nozzleTapSpacingTicks: 0,
     nozzleTapWaitTicks: 0,
@@ -376,19 +703,36 @@ export function createSuitActionState(): SuitActionState {
     siphonTargetY: 0,
     siphonTargetZ: 0,
     siphonLitersThisTick: 0,
+    piezoArcCdTicks: 0,
+    streamShockCdTicks: 0,
   };
 }
 
 export function createWorldState(runSeed: number): WorldState {
   const seed = runSeed >>> 0;
+  const entities: Entity[] = [];
+  const room = createEmptyRoomState(seed);
+  room.entitiesRef = entities;
   return {
     runSeed: seed,
     simTick: 0,
+    deck: null,
+    currentRoomId: 0,
+    nearbyDoor: null,
+    pendingAirlock: null,
     tankCapRank: 0,
     siphonRank: 0,
     nozzlePressureRank: 0,
     gravCdRank: 0,
+    fuseRank: 0,
+    liningRank: 0,
+    hasSparkPlug: false,
+    hasPiezoArc: false,
+    hasCryoNozzle: false,
     has3GOverdrive: false,
+    hasGyroStabilizer: false,
+    hasAblativePlating: false,
+    nearbyTerminalIndex: null,
     scrap: 0,
     kills: 0,
     podsTotal: 0,
@@ -397,7 +741,7 @@ export function createWorldState(runSeed: number): WorldState {
     clearTimeS: 0,
     nextEntityId: 1,
     player: createPlayerEntity(12.0, 0.2, 1.0),
-    entities: [],
+    entities,
     lockOn: null,
     playerTank: createStarterTank(0),
     gravityPulse: {
@@ -426,7 +770,7 @@ export function createWorldState(runSeed: number): WorldState {
       cryoBoiledOff: 0,
       acidConsumed: 0,
     },
-    room: createEmptyRoomState(seed),
+    room,
   };
 }
 

@@ -4,7 +4,7 @@
 
 ---
 
-> **STATUS (2026-11-20): Tier A COMPLETE** (`M1.1`, `M1.2`, `M1.3-lite`, `M2.1`, `M3.1`, `M2.2-lite`; `44/44` `node:test` invariants passing, `Drift=0`, `60.0 FPS` on 8GB M1 Air). Read **§11 Tier A Playtest Overrides & Tier B Handoff** before editing any Tier A constants, reactions, or VFX—those finalized values supersede earlier draft numbers in §2–§10.
+> **STATUS (2026-11-24): Tier A + Tier B Core + Visual Foundation + SHIFT-First Baseline COMPLETE** (`79/79` `node:test` invariants across 16 suites passing, `Drift = 0`, `60.0 FPS` locked on 8GB M1 Air at `~1–2 ms` sim / `~2 ms` render). **Read §12 (v2.5 Canonical Blueprint — 2026-11-24) before implementing any combat tuning, grid strides, procedural generation, or viewer cutaways**—§12 supersedes earlier draft values in §2–§11.
 
 ## 1. High-Concept Pitch
 **Shift Alchemist** is a 3D isometric action roguelite set aboard a derelict industrial freighter overrun by procedurally mutated Xenomorphs. Armed with a **Pressurized Fluid Nozzle**, a **Vacuum Siphon**, a **Fluid-Plumbed Jetpack**, and a **Local Gravity-Shift Pulse**, the player manipulates a real-time **10 cm (`0.1 m`) 3D cellular automata and ballistic particle sandbox** of **Water, Oil, Cryo-Coolant, Acid, Fire, Steam, Electricity, Wood, Ice, Glass, and Steel**—turning the ship's failing gravity and volatile cargo into kinetic and elemental chain reactions modeled after *Noita* and *Teardown*.
@@ -599,3 +599,131 @@ The current `activeCells` CA (`<= 5 ms` sim / `<= 2 ms` render on 8GB M1 Air wit
 * **3D Dirty-Chunk AABBs:** Replace `activeCells` + dedup bitsets + per-tick sorting with 6-byte dirty bounding boxes per `16³` chunk swept linearly in Y-order for cache-friendly, uncapped room-wide simulation.
 * **Neighbor Trim & Fast DDA (Safety Valve Only):** Only if M2.2 thermal reactions or `3G` exceed the `6 ms` sim budget, replace 26-neighbor `N_same` with 6-face (or 10-neighbor) checks and skip multi-step DDA for slow quanta (`|v| <= 6 m/s`).
 * **Large-Room Rendering & Threading:** Greedy-mesh sleeping fluid chunks (reserving instanced cubes for active chunks) and/or move the CA loop to WASM or a Web Worker (`SharedArrayBuffer` `2x2x2` checkerboard chunk passes) when expanding beyond the `28,672` fluid instance cap.
+
+---
+
+## 12. v2.5 Canonical Blueprint — Macro-Cell 3D Freighter & Combat Overhaul (2026-11-24)
+
+> **Superseding Scope:** All constants, structural rules, procedural generation passes, and visual cutaway contracts in this section **supersede conflicting earlier drafts in §2–§11**. Core conservation math (4 disjoint volume ledgers, `Drift = 0`), bit-packed `Uint32Array` voxel encoding, `16³` chunk meshing/fluid caching, and deterministic `hash32` simulation remain unchanged.
+
+### 12.1 *Wizard of Legend* Combat Feel & *Noita* Emergence Rebalance
+To eliminate slow "vacuum chore" pacing and passive full-room dogpiles, combat and suit responsiveness shift to fast, combo-driven alchemy from second one:
+
+| System | Previous Draft (§2 / §11) | Canonical v2.5 Value | Rationale & Mechanical Role |
+| :--- | :--- | :--- | :--- |
+| **Starting Tank** | Single Starter `120 L` (Baffled gated at Alcove 1) | **Baffled Dual-Chamber (`2 × 90 L` base, `[R]` swap) at Run Start** | Alchemy requires mixing 2 elements immediately. Arrival includes a small `OIL` domino flask beside the starter `WATER` vat/puddle so players enter Sector 1 armed with a 2-fluid combo. Workbench Terminal 2 converts to **High-Pressure Tank Expansion** (`+30 L`/chamber per rank -> `90 / 120 / 150 / 180 L` per chamber). |
+| **Siphon Rate** | `120 + 60*rank` L/s (`2..5` L/tick) | **`240 + 60*rank` L/s (`4..7` L/tick)** | Cuts tank refill time in half so siphoning flows mid-combat instead of feeling like a chore. |
+| **Air Burst (Empty Tank)** | `5 dmg`, `4.0–8.0 m` | **`0` raw HP dmg, `3.4 m` range** | Pure close-quarters kinetic shove, telegraph interrupt, glass/wood/ice breaker, and **`45 dmg` `3x CRYO SHATTER`** detonator on any embrittled (`<= -48°C`) target. Forces physics & alchemy kills. |
+| **Jetpack Micro-Dash** | `14 m/s`, `24` ticks (`0.4 s`), `51`-tick CD (`0.85–1.2 s`) | **`15.5 m/s`, `10` ticks (`~2.2–2.6 m`), `10 L` exhaust, `28`-tick CD (`0.47 s`)** | Tight, controllable *Wizard of Legend* weave dash that crosses doorways/hazards without overshooting into walls. |
+| **Gravity-Shift Cadence** | `GRAV_CD = 4.0..2.5 s` | **`GRAV_CD = 1.5 - 0.25*rank` s (`1.5 / 1.25 / 1.0 / 0.75 s`, `GRAV_CD_MIN = 0.75 s`) + Instant `Q -> C` Chain** | Pressing `C` (`2G`/`3G` Crush) while in `0G` (`Q`) **immediately chains into Crush with zero cooldown penalty**, enabling signature *loft fluid & enemies -> slam* combos. |
+| **Phase Explosions** | `20` nom. dmg, `1.8 m` radius | **`55` nom. dmg, `2.6 m` radius** | Violent, unmistakable *Noita* payoff: deletes Skitterers and rips heavy chunks off Armored Bruisers. |
+| **Enemy Alert Staging** | Instant `19–20 m` room-wide aggro | **Dormant patrol until `<= 8.0 m` + LOS, or vat/dam breach / ally hit within `8.0 m`** | Guarantees a 3-second *Noita* planning beat when entering a Sector or peeking into a new zone. |
+| **Elemental Enemy Death Bursts** | Passive liquid drop | **Reactive elemental payloads (`24–36 L`)** | Burning Skitterers burst in flaming oil; `2G`-Crushed Cryo Floaters release freezing Cryo clouds onto targets below; Voltaic Spitters electrify puddles on death. |
+| **HUD Callouts** | Raw per-tick popups (overlapping text) | **Per-entity coalescing (`>= 0.25 s` window per kind)** | Accumulates rapid DOT/splash ticks into one crisp, readable callout (`CRYO BLAST -55!`, `3x SHATTER!`, `GRAV CRUSH!`). |
+
+---
+
+### 12.2 Dynamic-Stride 3D Volume Buffer (Same `14.75 MB` RAM, Any 3D Shape)
+Instead of forcing every space into a flat `240 × 64 × 240` floorplan, the engine reshapes the exact same pre-allocated `Uint32Array(3,686,400)` (`<= 900` chunks of `16³`) per Sector:
+* **Invariant:** `roomW % 16 === 0`, `roomH % 16 === 0`, `roomD % 16 === 0`, and `(roomW >> 4) * (roomH >> 4) * (roomD >> 4) <= 900` (`roomW * roomH * roomD <= 3,686,400`).
+* **Dynamic Strides on `RoomState`:**
+  * `room.sliceStride = room.roomW * room.roomD`
+  * `cellIndex(room, x, y, z) = y * room.sliceStride + z * room.roomW + x`
+  * `room.chunksX = room.roomW >> 4`, `room.chunksY = room.roomH >> 4`, `room.chunksZ = room.roomD >> 4`
+  * `chunkIndex(room, cx, cy, cz) = (cy * room.chunksZ + cz) * room.chunksX + cx`
+* **Resulting 3D Envelopes (Zero Extra RAM):** One buffer freely accommodates `32.0 × 4.8 × 12.8 m` (`480` ch) horizontal trenches, `12.8 × 17.6 × 12.8 m` (`704` ch) 5-story vertical shafts, `9.6 × 20.8 × 9.6 m` (`468` ch) drop chutes, or `22.4 × 8.0 × 19.2 m` (`840` ch) multi-story L-bays.
+* **Migration Rule:** All `src/core/` and `src/viewer/` index arithmetic migrates from static `ARENA_W` / `SLICE_STRIDE` / `CHUNKS_X` / `CHUNKS_Z` constants to `room`'s dynamic stride fields; `MAX_VOXELS = 3,686,400` and `MAX_CHUNKS = 900` remain the pre-allocation ceilings.
+
+---
+
+### 12.3 Bottom-Up `3.2 m` Macro-Cell 3D Freighter Grammar (Zero Templates)
+Rooms are no longer built from fixed rectangular templates or overlapping subtractive box-carving. Every Freighter Sector is generated bottom-up on a coarse 3D integer **Macro-Cell Grid** and shrink-wrapped afterward.
+
+#### Atomic Macro-Cell Definition & Exact Chunk Alignment
+* **1 Macro-Cell = `32 × 32 × 32` voxels = `3.2 m × 3.2 m × 3.2 m` = `2 × 2 × 2` (`8`) engine chunks.**
+* **World Bounding Box (Shrink-Wrapped After Growth):**
+  * `roomW = spanX * 32`, `roomD = spanZ * 32`, `roomH = 16 + spanY * 32` (exact multiples of `16`).
+  * A dedicated **`16`-voxel (`1.6 m`) solid bottom keel** occupies `y = 0..15` (`y = 0` indestructible `BOUNDARY_HULL`, `y = 1..15` `HULL_STEEL`).
+  * Macro-cell `(gx, gy, gz)` maps cleanly to voxels `x ∈ [gx*32 .. gx*32+31]`, `y ∈ [16+gy*32 .. 47+gy*32]`, `z ∈ [gz*32 .. gz*32+31]`—exact `2×2×2` chunk alignment.
+  * Outer faces `x = 0`, `x = roomW-1`, `z = 0`, `z = roomD-1`, `y = 0`, `y = roomH-1` are sealed with `BOUNDARY_HULL`, and `y = roomH-2` is `HULL_STEEL` ceiling (leaving the top cell `3.0 m` clear headroom).
+* **Adjacent `open` cells fuse seamlessly** with no wall between them. Walls exist only where an `open` cell borders a `solid` cell or the outer boundary.
+
+#### Generation-Time Blueprint Schema (Read Only During Generation; Never Restricts Runtime)
+Each macro-cell `(gx, gy, gz)` holds blueprint metadata discarded once voxels are written:
+* `open: boolean` — carved air vs. solid ship hull.
+* `deptId: DepartmentId` — department theme assigned to this cell cluster (§12.5).
+* `fluid: MaterialId` — generation-time target fluid (`AIR | WATER | OIL | CRYO | ACID`). Exists solely to (1) guarantee dry buffer rings so traps never self-ignite/freeze/electrify on tick 1, (2) pair dam materials with liquids (`OIL` -> `WOOD_BARRIER`, `WATER`/`CRYO` -> `GLASS_VAT`), and (3) fuse adjacent trench cells into cohesive `4,000–8,000 L` basins with deliberate cross-zone elemental contrast.
+* **Strictly Disjoint Vertical Geometry Properties:**
+  * When `(gx, gy - 1, gz)` is `solid` (or `gy === 0` above the `16`-voxel keel), the cell uses **`floorStyle`**:
+    * `'flat_steel'`: flush deck at local `y = 0` (Entry staging, dry catalyst rims, cover pillars, Workbench pedestals).
+    * `'recessed_trench'`: digs `8` voxels (`0.8 m`) into the solid hull below (`local y = -8..-1`), leaving `>= 0.7 m` solid keel at `gy = 0` or `2.4 m` solid ceiling above `gy - 2`. Fills bottom `6` voxels (`0.6 m`, `local y = -8..-3`) with `cell.fluid`, preserving `0.2 m` dry freeboard so settled fluid stays calm until disturbed. Drop-offs `>= 0.3 m` automatically render hazard caution stripes.
+    * `'grate_over_trench'`: same `0.8 m` basin filled `0.6 m` deep (`local y = -8..-3`), capped flush at deck level with `2` voxels (`0.2 m`) of `STEEL_GRATE` (`local y = -2..-1`). Preserves full-speed `1G` *Wizard of Legend* footing while priming massive `[V]` (`-1G`) upward waterfall floods.
+  * When `(gx, gy - 1, gz)` is `open`, the cell ignores `floorStyle` and uses **`airStructure`**:
+    * `'empty'`: open vertical atrium / shaft airspace.
+    * `'wood_scaffold'`: burnable `0.2 m` `WOOD_BARRIER` shelf hugging North/West solid walls with vertical `WOOD_BARRIER` columns dropping down to the solid floor below.
+    * `'grate_catwalk'`: permeable `0.2 m` `STEEL_GRATE` mezzanine/bridge spanning open air.
+
+#### Sheer Vertical Drops & Climbs (Owner Confirmed — SHIFT-Mandatory Traversal)
+* Adjacent open cells differing by `>= 1` vertical macro-level (`3.2 m` per level) are **sheer vertical drops/climbs** (no automatic staircases or ramps between macro-levels).
+* Climbing upward requires **`Q` (`0G` + `E` ascend)** or **`V` (`-1G` inversion)**, making **"SHIFT"** a mandatory traversal verb across the ship.
+* **Softlock-Free Vertical Opening Invariant:** Every vertical connection (`gy <-> gy ± 1`) leaves an unobstructed vertical opening (or permeable `STEEL_GRATE` bypass with open atrium edge) of at least `2.4 m × 2.4 m` (`24 × 24` voxels).
+
+#### 4-Pass Pure Local Generation Pipeline
+1. **Pass 1 — 3D Void Growth & Shrink-Wrap:** Seeded 3D walker starts at `(0, 0, 0)` and marks `~35–65` connected cells `open` (total shrink-wrapped chunks `<= 900`), freely mixing `1`-wide (`3.2 m`) corridors, tall `1×N×1` / `2×N×2` shafts, and wide `4×2×4`–`5×2×5` brawl clusters (guaranteeing at least `1–2` open brawl clusters per Sector while treating narrow corridors and vertical chutes as first-class encounter spaces).
+2. **Pass 2 — Department Clustering & Pool/Trench Assignment:** Assign 2–3 Freighter Departments across connected cell regions. Select multi-cell floor groups for `recessed_trench` and `grate_over_trench` (cells lying on the Entry->Exit shortest path prefer `grate_over_trench` for smooth `1G` flow), enforcing cross-zone elemental contrast (e.g., `OIL`/`CRYO` perched above `WATER`).
+3. **Pass 3 — Neighbor-Driven Sub-Cell Architecture & Isometric Visibility:**
+   * **Breakable Dams (`recessed_trench` + Sheer Drop):** Any `recessed_trench` cell whose cardinal neighbor at `gy - 1` is `open` replaces its `1`-voxel retaining lip facing that drop with `WOOD_BARRIER` (if `cell.fluid === OIL`) or `GLASS_VAT` (if `WATER` or `CRYO`). Breaching the lip unleashes a sustained multi-second waterfall.
+   * **Isometric Visibility Rule (N/W Solid, S/E Open/Grate):** In stacked multi-story open cells, solid overhanging platforms hug only North (`-Z`) and West (`-X`) walls; center and South/East spans use `STEEL_GRATE` or open air so vertical shafts remain readable without laggy roof slicing.
+   * **Cover & Chokes:** Wide interior floor cells (4 open cardinal neighbors) optionally place `0.8 × 0.8 m` steel pillars or crate clusters; opposite-walled `1`-cell chokes optionally place burnable `WOOD_BARRIER` breach walls.
+   * **Acid-Ready `BOUNDARY_HULL` Anchors:** Outer room shell, bottom keel `y = 0`, all 6-way Hatch frames, and Workbench pedestals are stamped with indestructible `BOUNDARY_HULL`.
+4. **Pass 4 — Dry-Buffered Catalysts, Domino Flasks & Cross-Section-Matched Enemies:**
+   * Place catalysts on dry `flat_steel` rims `1–2` cells from matching pools (Furnace Grate near `OIL`/wood with `>= 4`-voxel dry buffer; Tesla Pylon on dry `WATER` rim; Leaking Cryo Pipe / suspended `GLASS_VAT` on upper N/W walls).
+   * Scatter fragile **`5 × 5 × 5` (`27 L` interior) Glass Domino Flasks** perched on pillars/crates or hanging over chokes for instant mid-fight chain reactions.
+   * **Entry Staging (`<= 2` macro-cells from Entry Hatch):** Zero active hostiles spawned -> guaranteed 3-second *Noita* read.
+   * **Geometry-Matched Enemies:** Open air above trenches/shafts -> **Gas-Bladder Floaters**; `wood_scaffold` / high ledges -> **Scaffold Spitters**; wide floor clusters (`>= 2` cells wide) -> **Armored Bruisers** + **Pack Skitterers**; `1`-wide corridors -> fast **Skitterers** + domino flasks (never body-blocking Bruisers).
+
+---
+
+### 12.4 Seamless Multi-Zone Sectors & 6-Way Ship Hatches
+To eliminate immersion-breaking airlock cuts every 30 seconds while staying inside the browser `14.75 MB` grid and `Drift = 0` snapshot architecture:
+* **Run Pacing:** **Arrival Airlock** (10-second `0G` Shift Gate + starter `WATER` & `OIL`) -> **3 Large Seamless Multi-Zone Sectors** (each `~35–65` macro-cells with zero internal airlock transitions and a Workbench Alcove near the exit) -> **Extraction** (Boss Sanctum remains Tier C stretch).
+* **Zone-to-Zone Inside a Sector = 100% Seamless:** Continuous camera follow, zero fade/pause, and cross-zone fluid/fire propagation across shared doorways, vertical shafts, and wooden breach walls.
+* **Sector-to-Sector = 6-Way Hatches (`N / S / E / W / UP / DOWN`):** Only `2–3` hatch transitions per full run. `UP` (ceiling) and `DOWN` (floor) hatches are `2.4 m × 2.4 m` `BOUNDARY_HULL`-framed bulkheads inset into the floor/ceiling of an open macro-cell (`[F]` within `2.0 m` when unlocked). The HUD minimap displays the current Sector's vertical deck layer with `UP`/`DOWN` indicators.
+
+---
+
+### 12.5 Modular Department Registries & Per-Cell Isometric Cutaway
+All world-building themes and trap rules live in three decoupled registries for effortless expansion (both pre-jam and post-jam):
+1. **`src/core/departments.ts` (Pure Data):** Declarative specs for starter departments — **`fuel_cargo`** (*Fuel & Timber Cargo*: `OIL`/`WATER`, wood dams, furnace grates, wood partitions), **`coolant_eng`** (*Coolant Engineering*: `CRYO`/`WATER`, glass dams, leaking cryo pipes, steam vents), **`voltage_bilge`** (*High-Voltage Bilge*: `WATER`/`OIL`, grate sumps, Tesla pylons, glass dams), and **`maintenance_spine`** (Entry/Connectors) — specifying `primaryFluid`, `secondaryFluid`, `damMaterial`, `catalystWeights`, `enemyWeights`, and `structureBias`.
+2. **`src/core/seamRules.ts` (Pluggable Local Rules):** Independent `{ canPlace(graph, cellOrFace, dept), stamp(room, cellOrFace, dept) }` modules for dams, sumps, wood scaffolds, breach chokes, pipes, and domino flasks.
+3. **`src/viewer/departmentPalettes.ts` & Generalized Cutaway (`greedyMesher.ts`, `scene3D.ts`):**
+   * **Per-Cell S/E Diorama Cutaway:** Replaces outer-bounding-box-only wall culling with a per-cell rule: *any* solid macro-cell wall bordering the **South (`+Z`) or East (`+X`) face** of an open cell cuts cleanly to a `0.4 m` dark-capped diorama curb, while **North (`-Z`) and West (`-X`) faces** render full height. Guarantees unobstructed isometric sightlines across arbitrary L-bays, doglegs, and 19 m vertical shafts.
+   * **Cell-Snapped Department Dressing:** Every full-height N/W solid face receives automatic shadow-casting vertical bulkhead ribs, department-colored horizon stripes, overhead conduit runs, and warm/cool localized sconce `PointLight` pools—visually signposting chemistry before you cross a threshold.
+
+---
+
+### 12.6 Steel-Eating `MAT.ACID` Breaching Contract (Acid-Ready Architecture)
+`MAT.ACID` is elevated from Boss-only fluid to a tactical multi-story breaching hazard with strict performance and conservation guardrails:
+* **Finite Corrosion Ratio (`Drift = 0`):** Dissolving `1` voxel of `HULL_STEEL` consumes **`2` liters (`2` voxels) of `MAT.ACID`** (atomically credited to `room.ledgers.acidConsumed`), turning a `27 L` Acid flask or spill into a finite floor-breaching charge that melts a clean `~0.8 m` hole rather than erasing the deck.
+* **Rate-Limited Dissolve Cadence (`60 FPS` Safe):** Acid corrosion ticks at **`~3.75 Hz`** (`(simTick & 15) === 0`, every 4th `15 Hz` cellular tick) so steel visibly sizzles over `2–3 s` while capping solid chunk remeshes to `1–2` chunks/frame.
+* **Counter-Material & Indestructible Anchors:** `BOUNDARY_HULL` (outer shell, `y = 0` keel, 6-way hatch frames, Workbench pedestals) and `ICE` (water-ledger phase) are strictly immune. In standard Freighter Sectors, `STEEL_GRATE` is **acid-resistant** (Acid pools atop grates without permeating or destroying them, creating natural catch basins and safe walkways; Boss Sanctum Phase 2 retains optional grate-carving override in Tier C).
+
+---
+
+### 12.7 Platform Decision & Execution Roadmap (Nov 24 -> Dec 1 Game Off)
+* **Stay in Browser WebGL for Game Off (Dec 1, 13:37 PST):** Current M1 Air performance is locked at `60.0 FPS` (`~1–2 ms` sim, `~2 ms` render) with `> 12 ms` frame headroom, and browser builds minimize itch.io voter friction. Native porting is deferred strictly post-Dec 1; the `32³` (`2×2×2` chunk) macro-cell grammar is designed to stream natively once ported.
+* **Execution Sequence (Feature Freeze Sat Nov 28):**
+  * **Phase A — Combat Feel & Emergence Pass:** Dual-Chamber start + `240 L/s` siphon, `3.4 m` `0`-dmg Air Burst, `10`-tick/`0.47 s` micro-dash, `1.5 s` `Q -> C` gravity chaining, `55 dmg / 2.6 m` Phase Explosions, dormant `8.0 m` AI staging, reactive elemental enemy death bursts, and coalesced HUD callouts.
+  * **Phase B — Dynamic-Stride Grid, `3.2 m` Macro-Cell Generator & Per-Cell Cutaway:** Dynamic `room` strides inside the `14.75 MB` buffer, 4-pass bottom-up macro-cell generator (sheer `3.2 m` vertical drops/climbs, deep `0.6–0.8 m` trenches & grate sumps, breakable dams, wood scaffolds, `5×5×5` domino flasks, modular `departments.ts`/`seamRules.ts`), 3-Sector run loop with 6-way `N/S/E/W/UP/DOWN` hatches, and generalized per-cell S/E cutaway + department palettes in `src/viewer/`.
+  * **Phase C — Acid Breaching, Anti-Softlock & Release Wrap (Saved for Last):** Rate-limited `MAT.ACID` steel corrosion + Acid flasks/department option, `45 s`/`60 s` anti-softlock failsafes, procedural WebAudio SFX, clean title/controls overlay & `?sandbox=1` gating for `[F4]`, and final `vite build && vite preview` `60 FPS` verification + itch.io submission.
+
+### Audit & Design Decisions (2026-11-24 — v2.5)
+
+| # | Where | Decision / Rationale | Spec Update |
+| :- | :--- | :--- | :--- |
+| D7 | §12.1 | Single empty starter tank + `4.0 s` `GRAV_CD` + `20 dmg` Phase Explosions + instant full-room aggro suppressed *Noita* planning and *Wizard of Legend* flow. | Dual-chamber tank at start, `240 L/s` siphon, `3.4 m` `0`-dmg Air Burst, `10`-tick/`0.47 s` micro-dash, `1.5 s` `Q->C` chaining, `55 dmg / 2.6 m` Phase Explosions, dormant `8 m` AI, coalesced callouts. |
+| D8 | §12.2–§12.3 | Small rectangular room templates + constant airlock cuts broke immersion and prevented vertical multi-story cascades. Subtractive overlapping-box carving risks slivers and scales poorly. | Dynamic strides inside existing `14.75 MB` (`<= 900` chunks) buffer + bottom-up `3.2 m` (`32³` / `2×2×2` chunk) macro-cell grid with `16`-voxel keel, disjoint `floorStyle`/`airStructure`, and pure 4-pass local rules. |
+| D9 | §12.3 | Deep pools (`0.6–0.8 m`, `4,000–8,000 L`) + elevated breakable dams create sustained *Noita* waterfalls; `cell.fluid` blueprint metadata prevents tick-1 self-destruction and pairs wood/glass dams cleanly. | Specified `recessed_trench` (`0.2 m` freeboard) and `grate_over_trench` (`1G` footing + `-1G` upward flood), strictly generation-time metadata. |
+| D10 | §12.3–§12.4 | Owner confirmed **sheer `3.2 m` vertical drops/climbs** (no inter-level stairs) and **6-way `N/S/E/W/UP/DOWN` hatches** connecting 3 large seamless Multi-Zone Sectors. | Makes `Q`/`V` SHIFT traversal structurally mandatory; cuts airlock transitions from `8–10` to `2–3` per run. |
+| D11 | §12.5 | Organic non-rectangular 3D layouts break outer-wall-only cutaways and hardcoded room themes. | Generalized per-cell S/E diorama cutaway (`0.4 m` curb) + decoupled `departments.ts`, `seamRules.ts`, and `departmentPalettes.ts` registries. |
+| D12 | §12.6–§12.7 | Steel-eating `MAT.ACID` fits vertical freighter emergence if volume-bounded and remesh-throttled; native port deferred past Game Off (Dec 1) to protect deadline and itch.io play rate. | `2 L` Acid per `1` `HULL_STEEL` voxel (`acidConsumed`), `~3.75 Hz` throttle, Acid-resistant `STEEL_GRATE`, `BOUNDARY_HULL` anchors; Phase A -> B -> C execution plan. |

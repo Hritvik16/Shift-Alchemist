@@ -1,9 +1,11 @@
+import { applyStructuralDamage } from './types.ts';
 import {
   ARENA_W,
   CHUNKS_X,
   CHUNKS_Z,
   CHUNK_SIZE,
   FIXED_DT,
+  FUSE_TICKS,
   GRATE_MAX_RUN,
   GRAVITY_ACCEL_BY_MODE,
   GRAVITY_MODE,
@@ -15,12 +17,15 @@ import {
   MAX_ACTIVE_BALLISTIC,
   MAX_ACTIVE_GRID_FLUID,
   MAX_DEFERRED_FLUID,
+  MAX_PRIMED_QUANTA,
   SLICE_STRIDE,
   TEMP_BYTE,
   TOTAL_CHUNKS,
   VOXEL_SIZE_M,
   type MaterialId,
 } from './balance.ts';
+import { applyEntityStun } from './ai.ts';
+import { triggerConduitWaterImpact, triggerElectricalPulseAt } from './electricity.ts';
 import { hash32 } from './hash.ts';
 import {
   BALLISTIC_FLAG,
@@ -40,6 +45,7 @@ import {
   isThermalSolidActiveEligible,
   moveCell,
   packVoxel,
+  pushCombatEvent,
   queuePhaseExplosion,
   swapCells,
   transitionCell,
@@ -80,10 +86,11 @@ const FACE_DX = [1, -1, 0, 0, 0, 0] as const;
 const FACE_DY = [0, 0, 1, -1, 0, 0] as const;
 const FACE_DZ = [0, 0, 0, 0, 1, -1] as const;
 
-function fireHasAdjacentFuel(room: RoomState, x: number, y: number, z: number): boolean {
+function fireHasAdjacentFuelOrFloor(room: RoomState, x: number, y: number, z: number): boolean {
   const g = room.grid;
   const idx = cellIndex(x, y, z);
   const isFuel = (m: number): boolean => m === MAT.OIL || m === MAT.WOOD_BARRIER;
+  if (y > 0 && isSolidMat(getMat(g[idx - SLICE_STRIDE]))) return true;
   if (x > 0 && isFuel(getMat(g[idx - 1]))) return true;
   if (x + 1 < room.roomW && isFuel(getMat(g[idx + 1]))) return true;
   if (z > 0 && isFuel(getMat(g[idx - ARENA_W]))) return true;
@@ -238,7 +245,7 @@ function commitGridFluid(
   const idx = cellIndex(x, y, z);
   const shimmer = hash32(room.roomSeed, 0, idx) & 7;
   const slideDir = isLiquidMat(mat) ? hash32(room.roomSeed, simTick, idx) & 3 : 0;
-  const timer = mat === MAT.STEAM ? 45 : mat === MAT.FIRE ? 30 : chargeUnits & 0x3f;
+  const timer = mat === MAT.STEAM ? 45 : mat === MAT.FIRE ? 54 : chargeUnits & 0x3f;
   const val = packVoxel(mat, tempByte, timer, 0, shimmer, slideDir, 0);
   writeCell(room, x, y, z, val, simTick);
 }
@@ -639,12 +646,74 @@ export function processPendingVatShatters(world: WorldState): void {
   room.pendingVatShatters.length = 0;
 }
 
+function countAndDetonateOldestPrimedIfOverCap(world: WorldState): void {
+  const bp = world.room.ballistic;
+  let primedCount = 0;
+  let oldestSlot = -1;
+  let oldestFlight = -1;
+  for (let i = 0; i < MAX_ACTIVE_BALLISTIC; i++) {
+    if (bp.active[i] === 0) continue;
+    if ((bp.flags[i] & BALLISTIC_FLAG.PRIMED) === 0) continue;
+    primedCount++;
+    if (bp.flightTicks[i] > oldestFlight) {
+      oldestFlight = bp.flightTicks[i];
+      oldestSlot = i;
+    }
+  }
+  if (primedCount >= MAX_PRIMED_QUANTA && oldestSlot >= 0) {
+    const tx = Math.floor(bp.x[oldestSlot] / VOXEL_SIZE_M);
+    const ty = Math.floor(bp.y[oldestSlot] / VOXEL_SIZE_M);
+    const tz = Math.floor(bp.z[oldestSlot] / VOXEL_SIZE_M);
+    applyBallisticImpactTransitionOrPlace(world, oldestSlot, tx, ty, tz, true);
+  }
+}
+
+export function detonatePrimedInRadius(
+  world: WorldState,
+  cx: number,
+  cy: number,
+  cz: number,
+  radiusM: number,
+): void {
+  const bp = world.room.ballistic;
+  if (bp.count === 0) return;
+  const rSq = radiusM * radiusM;
+  for (let i = 0; i < MAX_ACTIVE_BALLISTIC; i++) {
+    if (bp.active[i] === 0) continue;
+    if ((bp.flags[i] & BALLISTIC_FLAG.PRIMED) === 0) continue;
+    const dx = bp.x[i] - cx;
+    const dy = bp.y[i] - cy;
+    const dz = bp.z[i] - cz;
+    if (dx * dx + dy * dy + dz * dz <= rSq) {
+      const tx = Math.floor(bp.x[i] / VOXEL_SIZE_M);
+      const ty = Math.floor(bp.y[i] / VOXEL_SIZE_M);
+      const tz = Math.floor(bp.z[i] / VOXEL_SIZE_M);
+      applyBallisticImpactTransitionOrPlace(world, i, tx, ty, tz, true);
+    }
+  }
+}
+
+function isPrimedNearFire(room: RoomState, vx: number, vy: number, vz: number): boolean {
+  const g = room.grid;
+  if (inRoomBounds(room, vx, vy, vz) && getMat(g[cellIndex(vx, vy, vz)]) === MAT.FIRE) return true;
+  for (let f = 0; f < 6; f++) {
+    const nx = vx + FACE_DX[f];
+    const ny = vy + FACE_DY[f];
+    const nz = vz + FACE_DZ[f];
+    if (inRoomBounds(room, nx, ny, nz) && getMat(g[cellIndex(nx, ny, nz)]) === MAT.FIRE) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function applyBallisticImpactTransitionOrPlace(
   world: WorldState,
   slot: number,
   targetX: number,
   targetY: number,
   targetZ: number,
+  forceDetonate = false,
 ): boolean {
   const room = world.room;
   const bp = room.ballistic;
@@ -652,6 +721,33 @@ function applyBallisticImpactTransitionOrPlace(
   const mat = getMat(val);
   const temp = getTempByte(val);
   const charge = getTimerOrCharge(val);
+  const flags = bp.flags[slot];
+  const firedByPlayer = (flags & BALLISTIC_FLAG.FIRED_BY_PLAYER) !== 0;
+
+  // Phase-Lock Fuse (Ranks 1-2, §9): prime reactive firedByPlayer quanta on impact instead of immediate transition
+  const willTransition =
+    (mat === MAT.OIL && temp >= TEMP_BYTE.OIL_IGNITE) ||
+    (mat === MAT.WATER && temp >= TEMP_BYTE.BOIL) ||
+    (mat === MAT.CRYO && temp >= TEMP_BYTE.FREEZE);
+  if (
+    !forceDetonate &&
+    willTransition &&
+    firedByPlayer &&
+    world.fuseRank >= 1 &&
+    (flags & BALLISTIC_FLAG.IGNITE_IN_FLIGHT) === 0 &&
+    (flags & BALLISTIC_FLAG.PRIMED) === 0
+  ) {
+    countAndDetonateOldestPrimedIfOverCap(world);
+    bp.flags[slot] |= BALLISTIC_FLAG.PRIMED;
+    bp.fuseTicks[slot] = FUSE_TICKS[Math.min(2, world.fuseRank)];
+    bp.x[slot] = (targetX + 0.5) * VOXEL_SIZE_M;
+    bp.y[slot] = (targetY + 0.5) * VOXEL_SIZE_M;
+    bp.z[slot] = (targetZ + 0.5) * VOXEL_SIZE_M;
+    bp.vx[slot] = 0;
+    bp.vy[slot] = 0;
+    bp.vz[slot] = 0;
+    return true;
+  }
 
   // Base impact phase transition rule (§3.1)
   if (mat === MAT.OIL && temp >= TEMP_BYTE.OIL_IGNITE) {
@@ -742,11 +838,14 @@ function applyBallisticImpactTransitionOrPlace(
     return false;
   }
 
+  // Cryo-Expansion Nozzle (§9): chilled WATER (<= 0 C) freezes 1:1 into solid ICE on impact
+  const placeMat =
+    firedByPlayer && mat === MAT.WATER && temp <= TEMP_BYTE.FREEZE ? MAT.ICE : mat;
   const ok = placeOrDeferFluid(
     room,
-    mat,
+    placeMat,
     temp,
-    charge,
+    placeMat === MAT.ICE ? 0 : charge,
     targetX,
     targetY,
     targetZ,
@@ -755,6 +854,56 @@ function applyBallisticImpactTransitionOrPlace(
     world.simTick,
   );
   if (ok) {
+    // Instant ballistic GLASS_VAT thermal shock (|dT| >= 140 C breaches the exact impacted glass face before 1G drop)
+    if (
+      placeMat === MAT.WATER ||
+      placeMat === MAT.OIL ||
+      placeMat === MAT.CRYO ||
+      placeMat === MAT.STEAM ||
+      placeMat === MAT.FIRE ||
+      placeMat === MAT.ACID
+    ) {
+      const g = room.grid;
+      for (let f = 0; f < 6; f++) {
+        const nx = targetX + FACE_DX[f];
+        const ny = targetY + FACE_DY[f];
+        const nz = targetZ + FACE_DZ[f];
+        if (!inRoomBounds(room, nx, ny, nz)) continue;
+        const nVal = g[cellIndex(nx, ny, nz)];
+        if (getMat(nVal) !== MAT.GLASS_VAT) continue;
+        if (Math.abs(temp - getTempByte(nVal)) >= 35) {
+          applyStructuralDamage(room, nx, ny, nz, 4, false, world.simTick);
+        }
+      }
+    }
+
+    // Live Sparking Conduit contact: splash-down arc to puddle below + continuous hose backfeed
+    if (placeMat === MAT.WATER || placeMat === MAT.ACID) {
+      for (let ei = 0; ei < room.emitters.length; ei++) {
+        const em = room.emitters[ei];
+        if (em.kind !== 'conduit') continue;
+        if (
+          Math.abs(targetX - em.x) <= 2 &&
+          Math.abs(targetY - em.y) <= 2 &&
+          Math.abs(targetZ - em.z) <= 2
+        ) {
+          triggerConduitWaterImpact(world, ei, targetX, targetY, targetZ, firedByPlayer);
+          break;
+        }
+      }
+    }
+
+    // Piezo-Arc Coil (§9): charged fired/dashed WATER triggers local BFS pulse on landing (0.5 s CD)
+    if (
+      firedByPlayer &&
+      placeMat === MAT.WATER &&
+      charge >= 40 &&
+      world.suit.piezoArcCdTicks === 0
+    ) {
+      if (triggerElectricalPulseAt(room, targetX, targetY, targetZ, 60, world.simTick)) {
+        world.suit.piezoArcCdTicks = 30;
+      }
+    }
     deactivateBallistic(room, slot);
     return true;
   }
@@ -784,6 +933,18 @@ export function stepBallisticsStage3(world: WorldState): void {
     const mat = getMat(val);
     const temp = getTempByte(val);
     const flags = bp.flags[i];
+
+    // Phase-Lock Fuse primed quanta hold in place until fuse hits 0 or adjacent FIRE triggers chain ignition (§9)
+    if ((flags & BALLISTIC_FLAG.PRIMED) !== 0) {
+      const cx = Math.floor(bp.x[i] / VOXEL_SIZE_M);
+      const cy = Math.floor(bp.y[i] / VOXEL_SIZE_M);
+      const cz = Math.floor(bp.z[i] / VOXEL_SIZE_M);
+      if (bp.fuseTicks[i] > 0) bp.fuseTicks[i]--;
+      if (bp.fuseTicks[i] === 0 || isPrimedNearFire(room, cx, cy, cz)) {
+        applyBallisticImpactTransitionOrPlace(world, i, cx, cy, cz, true);
+      }
+      continue;
+    }
 
     // Spark-Plug Igniter in-flight exception (§3.1)
     if (
@@ -903,6 +1064,33 @@ export function stepBallisticsStage3(world: WorldState): void {
           if (curMat === MAT.ICE && hitEntity !== player && speed >= 4.0) {
             const brittleMult = hitEntity.tempByte <= TEMP_BYTE.EMBRITTLED ? 3 : 1;
             hitEntity.hp = Math.max(0, hitEntity.hp - 4 * brittleMult);
+          }
+          if (curMat === MAT.CRYO && hitEntity !== player) {
+            const wasFrozen = hitEntity.tempByte <= TEMP_BYTE.EMBRITTLED;
+            hitEntity.tempByte = Math.max(TEMP_BYTE.CRYO, hitEntity.tempByte - 4);
+            hitEntity.hp = Math.max(0, hitEntity.hp - 1);
+            if (!wasFrozen && hitEntity.tempByte <= TEMP_BYTE.EMBRITTLED) {
+              pushCombatEvent(room, {
+                kind: 'shatter',
+                entityId: hitEntity.id,
+                x: hitEntity.x,
+                y: hitEntity.y + hitEntity.height + 0.15,
+                z: hitEntity.z,
+                value: 0,
+                colorHex: 0x7ef9ff,
+                label: 'FROZEN! (3x SHATTER)',
+              });
+            }
+          } else if (curMat === MAT.WATER && hitEntity !== player) {
+            hitEntity.wetTicks = 120;
+            hitEntity.burnTicks = 0;
+            if (getTimerOrCharge(curVal) > 0 && hitEntity.carapace !== 'insulated') {
+              hitEntity.shockTicks = 18;
+              hitEntity.hp = Math.max(0, hitEntity.hp - (hitEntity.carapace === 'armored' ? 4 : 2));
+              if (hitEntity.kind === 'alien') applyEntityStun(room, hitEntity, 45, false, true);
+            }
+          } else if (curMat === MAT.OIL && hitEntity !== player && hitEntity.burnTicks > 0) {
+            hitEntity.burnTicks = Math.max(hitEntity.burnTicks, 240);
           }
         }
         const tx = hasLastAir ? lastAirX : gx;
@@ -1190,7 +1378,7 @@ function stepSingleFluidSubPass(
       if (isGasOrPlasmaMat(mat)) {
         const fireAnchored =
           mat === MAT.FIRE &&
-          ((getTimerOrCharge(val) > 20 && fireHasAdjacentFuel(room, x, y, z)) || (simTick & 1) !== 0);
+          ((getTimerOrCharge(val) > 20 && fireHasAdjacentFuelOrFloor(room, x, y, z)) || (simTick & 1) !== 0);
         if (!fireAnchored) {
         // Isotropic seeded 6-neighbor step in 0G
         const startFace = hash32(room.roomSeed, simTick, idx) % 6;
@@ -1286,7 +1474,7 @@ function stepSingleFluidSubPass(
     } else if (isGasOrPlasmaMat(mat)) {
       const fireAnchored =
         mat === MAT.FIRE &&
-        ((getTimerOrCharge(val) > 20 && fireHasAdjacentFuel(room, x, y, z)) || (simTick & 1) !== 0);
+        ((getTimerOrCharge(val) > 20 && fireHasAdjacentFuelOrFloor(room, x, y, z)) || (simTick & 1) !== 0);
       if (!fireAnchored) {
       // Rule 1B: Explicit Upward Buoyancy (-dirY), Grate Permeation (GRATE_MAX_RUN=2), Gas/Liquid Swaps
       const upY = y - dirY;
@@ -1820,6 +2008,13 @@ export function drainOrSerializeBallistics(
 
   for (let i = 0; i < MAX_ACTIVE_BALLISTIC; i++) {
     if (bp.active[i] === 0) continue;
+    if ((bp.flags[i] & BALLISTIC_FLAG.PRIMED) !== 0) {
+      const tx = Math.floor(bp.x[i] / VOXEL_SIZE_M);
+      const ty = Math.floor(bp.y[i] / VOXEL_SIZE_M);
+      const tz = Math.floor(bp.z[i] / VOXEL_SIZE_M);
+      applyBallisticImpactTransitionOrPlace(world, i, tx, ty, tz, true);
+      if (bp.active[i] === 0) continue;
+    }
     const val = bp.packedVoxel[i];
     const mat = getMat(val);
     const temp = getTempByte(val);

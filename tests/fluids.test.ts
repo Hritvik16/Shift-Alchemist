@@ -9,7 +9,7 @@ import {
   MAX_ACTIVE_BALLISTIC,
   MAX_DEFERRED_FLUID,
   TEMP_BYTE,
-} from './balance.ts';
+} from '../src/core/balance.ts';
 import {
   countNSame,
   drainOrSerializeBallistics,
@@ -17,9 +17,9 @@ import {
   reseedActiveLists,
   spawnBallistic,
   stepFluidMovementStage4,
-} from './fluids.ts';
-import { stepWorldTick } from './physics.ts';
-import { generateCargoHold } from './roomGen.ts';
+} from '../src/core/fluids.ts';
+import { stepWorldTick } from '../src/core/physics.ts';
+import { generateCargoHold } from '../src/core/roomGen.ts';
 import {
   carveSphereDebug,
   cellChunkIndex,
@@ -31,8 +31,8 @@ import {
   recomputeRoomLedgers,
   resetRoomRuntimeTransient,
   writeCell,
-} from './types.ts';
-import { createEmptyInput, createWorldState, type WorldState } from './world.ts';
+} from '../src/core/types.ts';
+import { createEmptyInput, createWorldState, type WorldState } from '../src/core/world.ts';
 
 function makeCargoWorld(seed = 2026): WorldState {
   const world = createWorldState(seed);

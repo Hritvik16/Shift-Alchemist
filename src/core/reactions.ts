@@ -1,3 +1,4 @@
+import { isElectricConductorMat } from './electricity.ts';
 import {
   AMBIENT_RELAX_DIV,
   ARENA_W,
@@ -18,8 +19,9 @@ import {
   TEMP_BYTE,
   VOXEL_SIZE_M,
 } from './balance.ts';
+import { applyEntityStun } from './ai.ts';
 import { hasAirBurstLOS } from './combat.ts';
-import { spawnBallistic, voxelOverlapsEntity } from './fluids.ts';
+import { detonatePrimedInRadius, placeOrDeferFluid, spawnBallistic, voxelOverlapsEntity } from './fluids.ts';
 import { hash32 } from './hash.ts';
 import {
   applyStructuralDamage,
@@ -34,6 +36,7 @@ import {
   isSolidMat,
   isThermalSolidActiveEligible,
   packVoxel,
+  pushCombatEvent,
   queuePhaseExplosion,
   transitionCell,
   wake26Neighbors,
@@ -66,6 +69,42 @@ const EXPLOSION_DIRS: readonly [number, number, number][] = (() => {
 const stage5FluidBuf = new Int32Array(MAX_ACTIVE_GRID_FLUID * 2);
 const stage5ThermalBuf = new Int32Array(MAX_ACTIVE_THERMAL_SOLIDS * 2);
 const explosionHitIndices = new Int32Array(26);
+
+const WOOD_IGNITE_TEMP_BYTE = 85; // +140 C (above steam/boil, catches from fire/oil/vent)
+const GLASS_THERMAL_SHOCK_DELTA_BYTES = 35; // 140 C in 4 C steps (§6.1 Stage 5d, §7)
+
+function isThermalShockSourceMat(mat: number): boolean {
+  return (
+    mat === MAT.WATER ||
+    mat === MAT.OIL ||
+    mat === MAT.CRYO ||
+    mat === MAT.STEAM ||
+    mat === MAT.FIRE ||
+    mat === MAT.ACID
+  );
+}
+
+function checkGlassThermalShockNeighbors(
+  room: RoomState,
+  x: number,
+  y: number,
+  z: number,
+  sourceTempByte: number,
+  simTick: number,
+): void {
+  const g = room.grid;
+  for (let f = 0; f < 6; f++) {
+    const nx = x + FACE_DX[f];
+    const ny = y + FACE_DY[f];
+    const nz = z + FACE_DZ[f];
+    if (!inRoomBounds(room, nx, ny, nz)) continue;
+    const nVal = g[cellIndex(nx, ny, nz)];
+    if (getMat(nVal) !== MAT.GLASS_VAT) continue;
+    if (Math.abs(sourceTempByte - getTempByte(nVal)) >= GLASS_THERMAL_SHOCK_DELTA_BYTES) {
+      applyStructuralDamage(room, nx, ny, nz, 4, false, simTick);
+    }
+  }
+}
 
 function isConductiveMat(mat: number): boolean {
   return (
@@ -293,9 +332,36 @@ export function stepReactionsStage5(world: WorldState): void {
         }
       }
     };
-    // 5x3x5 base collar heats deck puddles touching the vent housing; 3x10x3 vertical plume above
-    heatBox(em.x - 2, em.x + 2, em.y, em.y + 2, em.z - 2, em.z + 2);
+    // 7x3x7 furnace grate base collar heats deck puddles & enemies cleanly; 3x10x3 vertical plume above
+    heatBox(em.x - 3, em.x + 3, em.y, em.y + 2, em.z - 3, em.z + 3);
     heatBox(em.x - 1, em.x + 1, em.y + 3, em.y + 12, em.z - 1, em.z + 1);
+    checkGlassThermalShockNeighbors(room, em.x, em.y + 3, em.z, TEMP_BYTE.THERMAL_VENT, simTick);
+  }
+
+  // (a1b) Leaking Cryo Pipe: 1 L per 15 Hz tick (15 L/s) from finite 500 L Emitter(CRYO) reserve (§3.2, §9)
+  for (let i = 0; i < room.emitters.length; i++) {
+    const em = room.emitters[i];
+    if (em.kind !== 'cryo_pipe' || em.reserveL <= 0) continue;
+    const ox = em.x + (em.faceDir === '+X' ? 2 : em.faceDir === '-X' ? -2 : 0);
+    const oy = em.y + (em.faceDir === '+Y' ? 2 : 0);
+    const oz = em.z + (em.faceDir === '+Z' ? 2 : em.faceDir === '-Z' ? -2 : 0);
+    if (!inRoomBounds(room, ox, oy, oz)) continue;
+    checkGlassThermalShockNeighbors(room, ox, oy, oz, TEMP_BYTE.CRYO, simTick);
+    const placed = placeOrDeferFluid(
+      room,
+      MAT.CRYO,
+      TEMP_BYTE.CRYO,
+      0,
+      ox,
+      oy,
+      oz,
+      true,
+      world.player,
+      simTick,
+    );
+    if (placed) {
+      em.reserveL--;
+    }
   }
 
   const { fluidCount, thermalCount } = collectStage5Lists(room);
@@ -401,6 +467,163 @@ export function stepReactionsStage5(world: WorldState): void {
     }
   }
 
+  // (c.4) Oil Flashover & Flammable WOOD Combustion (0.3 m radiant box, dy -2..1 downward radiation, 0 fluid drift)
+  for (let i = 0; i < fluidCount; i++) {
+    const idx = stage5FluidBuf[i];
+    const val = g[idx];
+    const mat = getMat(val);
+    if (mat !== MAT.FIRE) continue;
+
+    const y = Math.floor(idx / SLICE_STRIDE);
+    const rem = idx - y * SLICE_STRIDE;
+    const z = Math.floor(rem / ARENA_W);
+    const x = rem - z * ARENA_W;
+
+    for (let dy = -2; dy <= 1; dy++) {
+      const ny = y + dy;
+      if (ny < 1 || ny >= room.roomH - 1) continue;
+      for (let dz = -3; dz <= 3; dz++) {
+        const nz = z + dz;
+        if (nz < 1 || nz >= room.roomD - 1) continue;
+        for (let dx = -3; dx <= 3; dx++) {
+          if (dx === 0 && dy === 0 && dz === 0) continue;
+          const nx = x + dx;
+          if (nx < 1 || nx >= room.roomW - 1) continue;
+          const nIdx = cellIndex(nx, ny, nz);
+          const nVal = g[nIdx];
+          const nMat = getMat(nVal);
+          if (nMat === MAT.OIL && getTempByte(nVal) < 111 && hasAdjacentAir(room, nx, ny, nz)) {
+            writeCellTempByte(room, nx, ny, nz, nVal, 111, simTick);
+          } else if (nMat === MAT.WOOD_BARRIER && Math.abs(dx) + Math.abs(dy) + Math.abs(dz) === 1) {
+            const curT = getTempByte(nVal);
+            if (curT < TEMP_BYTE.FIRE) {
+              writeCellTempByte(room, nx, ny, nz, nVal, Math.min(TEMP_BYTE.FIRE, curT + 18), simTick);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Burning WOOD spreads fire to neighboring WOOD, spawns rising FIRE flames, quenches on WATER, and burns away to AIR
+  const reactionTick = simTick >>> 2;
+  for (let i = 0; i < thermalCount; i++) {
+    const idx = stage5ThermalBuf[i];
+    const val = g[idx];
+    if (getMat(val) !== MAT.WOOD_BARRIER) continue;
+    const tByte = getTempByte(val);
+    if (tByte < WOOD_IGNITE_TEMP_BYTE) continue;
+
+    const y = Math.floor(idx / SLICE_STRIDE);
+    const rem = idx - y * SLICE_STRIDE;
+    const z = Math.floor(rem / ARENA_W);
+    const x = rem - z * ARENA_W;
+
+    // Quench immediately if touching WATER or CRYO
+    let quenched = false;
+    for (let f = 0; f < 6; f++) {
+      const nx = x + FACE_DX[f];
+      const ny = y + FACE_DY[f];
+      const nz = z + FACE_DZ[f];
+      if (!inRoomBounds(room, nx, ny, nz)) continue;
+      const nm = getMat(g[cellIndex(nx, ny, nz)]);
+      if (nm === MAT.WATER || nm === MAT.CRYO) {
+        writeCellTempByte(room, x, y, z, val, TEMP_BYTE.AMBIENT, simTick);
+        quenched = true;
+        break;
+      }
+    }
+    if (quenched) continue;
+
+    // Spread heat to adjacent WOOD with upward chimney bias (dy -1..2) so fire climbs scaffold legs into loft decks
+    for (let dy = -1; dy <= 2; dy++) {
+      const ny = y + dy;
+      if (ny < 1 || ny >= room.roomH - 1) continue;
+      for (let dz = -1; dz <= 1; dz++) {
+        const nz = z + dz;
+        if (nz < 1 || nz >= room.roomD - 1) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0 && dz === 0) continue;
+          const nx = x + dx;
+          if (nx < 1 || nx >= room.roomW - 1) continue;
+          const nVal = g[cellIndex(nx, ny, nz)];
+          if (getMat(nVal) === MAT.WOOD_BARRIER && getTempByte(nVal) < WOOD_IGNITE_TEMP_BYTE + 20) {
+            writeCellTempByte(room, nx, ny, nz, nVal, Math.min(TEMP_BYTE.FIRE, getTempByte(nVal) + 14), simTick);
+          }
+        }
+      }
+    }
+
+    // Emit sustained roaring FIRE flames onto exposed AIR faces above & beside burning wood (0 fluid drift)
+    if (((reactionTick + x + z) % 2) === 0) {
+      const aboveY = y + 1;
+      if (inRoomBounds(room, x, aboveY, z) && getMat(g[cellIndex(x, aboveY, z)]) === MAT.AIR) {
+        writeCell(room, x, aboveY, z, packVoxel(MAT.FIRE, TEMP_BYTE.FIRE, 38, 0, (reactionTick + x) & 7), simTick);
+      } else {
+        const fDir = (reactionTick + x + y + z) & 3;
+        const fx = x + FACE_DX[fDir];
+        const fz = z + FACE_DZ[fDir];
+        if (inRoomBounds(room, fx, y, fz) && getMat(g[cellIndex(fx, y, fz)]) === MAT.AIR) {
+          writeCell(room, fx, y, fz, packVoxel(MAT.FIRE, TEMP_BYTE.FIRE, 34, 0, (reactionTick + z) & 7), simTick);
+        }
+      }
+    }
+
+    // Burn steadily across all 12 struct HP (~2.8 s per voxel, ~4-5 s for full scaffold collapse)
+    if (((reactionTick + x * 7 + y * 13 + z * 19) % 3) === 0) {
+      applyStructuralDamage(room, x, y, z, 1, false, simTick);
+    }
+  }
+
+  // (c.5) Electrical Spark Ignition: conductor >= +40V (20 units) arcs into adjacent OIL + AIR (§6.1)
+  const runSparkIgnition = (buf: Int32Array, count: number): void => {
+    for (let i = 0; i < count; i++) {
+      const idx = buf[i];
+      const val = g[idx];
+      const mat = getMat(val);
+      if (!isElectricConductorMat(mat)) continue;
+      let charge = getTimerOrCharge(val);
+      if (charge < 20) continue;
+
+      const y = Math.floor(idx / SLICE_STRIDE);
+      const rem = idx - y * SLICE_STRIDE;
+      const z = Math.floor(rem / ARENA_W);
+      const x = rem - z * ARENA_W;
+
+      for (let f = 0; f < 6 && charge >= 20; f++) {
+        const nx = x + FACE_DX[f];
+        const ny = y + FACE_DY[f];
+        const nz = z + FACE_DZ[f];
+        if (!inRoomBounds(room, nx, ny, nz)) continue;
+        const nVal = g[cellIndex(nx, ny, nz)];
+        if (getMat(nVal) !== MAT.OIL) continue;
+        if (!hasAdjacentAir(room, nx, ny, nz)) continue;
+
+        charge -= 10;
+        const updatedCond = ((g[idx] & ~(0x3f << 16)) | ((charge & 0x3f) << 16)) >>> 0;
+        writeCell(room, x, y, z, updatedCond, simTick);
+        if (getTempByte(nVal) < TEMP_BYTE.OIL_IGNITE) {
+          writeCellTempByte(room, nx, ny, nz, nVal, TEMP_BYTE.OIL_IGNITE, simTick);
+        }
+      }
+    }
+  };
+  runSparkIgnition(stage5FluidBuf, fluidCount);
+  runSparkIgnition(stage5ThermalBuf, thermalCount);
+
+  // (d0) GLASS_VAT Thermal Shock (|T_source - T_glass| >= 140C strictly against fluid/gas sources, §6.1, §7)
+  for (let i = 0; i < fluidCount; i++) {
+    const idx = stage5FluidBuf[i];
+    const val = g[idx];
+    const mat = getMat(val);
+    if (!isThermalShockSourceMat(mat)) continue;
+    const y = Math.floor(idx / SLICE_STRIDE);
+    const rem = idx - y * SLICE_STRIDE;
+    const z = Math.floor(rem / ARENA_W);
+    const x = rem - z * ARENA_W;
+    checkGlassThermalShockNeighbors(room, x, y, z, getTempByte(val), simTick);
+  }
+
   // (d) Instant CRYO Boil-Off Phase Explosion (>= +100C contact or plume)
   for (let i = 0; i < fluidCount; i++) {
     const idx = stage5FluidBuf[i];
@@ -461,18 +684,7 @@ export function stepReactionsStage5(world: WorldState): void {
     }
   }
 
-  for (let i = 0; i < thermalCount; i++) {
-    const idx = stage5ThermalBuf[i];
-    const val = g[idx];
-    if (getMat(val) !== MAT.WOOD_BARRIER || getTempByte(val) < TEMP_BYTE.WOOD_IGNITE) continue;
-    const y = Math.floor(idx / SLICE_STRIDE);
-    const rem = idx - y * SLICE_STRIDE;
-    const z = Math.floor(rem / ARENA_W);
-    const x = rem - z * ARENA_W;
-    if (hasAdjacentAir(room, x, y, z)) {
-      transitionCell(room, x, y, z, MAT.FIRE, TEMP_BYTE.FIRE, simTick);
-    }
-  }
+  // Heated WOOD_BARRIER burns progressively via step (c.4) above instead of vaporizing on tick 1
 
   // (f) WATER <-> ICE / STEAM phase changes & CRYO finite freezing/chilling/sublimation
   for (let i = 0; i < fluidCount; i++) {
@@ -760,6 +972,9 @@ export function stepPhaseExplosionsStage6(world: WorldState): void {
       });
     }
 
+    // 0. Chain-detonate any Phase-Lock Fuse primed quanta inside the 1.8 m blast radius (§9)
+    detonatePrimedInRadius(world, cx, cy, cz, EXPLOSION_RADIUS_M);
+
     // 1. Entity damage + clamped radial impulse (unobstructed 3D DDA LOS)
     const entities: Entity[] = [world.player];
     for (let i = 0; i < world.entities.length; i++) {
@@ -780,11 +995,25 @@ export function stepPhaseExplosionsStage6(world: WorldState): void {
       if (!hasAirBurstLOS(room, cx, cy, cz, tx, ty, tz)) continue;
 
       const f = 1 - d / EXPLOSION_RADIUS_M;
-      const dmg = Math.round(EXPLOSION_DMG_NOM * f);
-      if (dmg > 0) e.hp = Math.max(0, e.hp - dmg);
+      const blastDamped = e.kind === 'player' && wave.playerOnly && world.liningRank >= 1;
+      const dmg = blastDamped ? 0 : Math.round(EXPLOSION_DMG_NOM * f);
+      if (dmg > 0) {
+        e.hp = Math.max(0, e.hp - dmg);
+        pushCombatEvent(room, {
+          kind: 'damage',
+          entityId: e.id,
+          x: e.x,
+          y: e.y + e.height,
+          z: e.z,
+          value: dmg,
+          colorHex: wave.kind === 'cryo' ? 0x7ef9ff : 0xffffff,
+          label: wave.kind === 'cryo' ? `CRYO BLAST -${dmg}` : `STEAM BLAST -${dmg}`,
+        });
+      }
 
       const massKg = getEffectiveMassKg(e, world.playerTank);
-      const dv = Math.max(1.5 * f, Math.min(12.0 * f, (EXPLOSION_IMPULSE_NOM * f) / Math.max(1, massKg)));
+      const rawDv = Math.max(1.5 * f, Math.min(12.0 * f, (EXPLOSION_IMPULSE_NOM * f) / Math.max(1, massKg)));
+      const dv = blastDamped ? rawDv * 0.5 : rawDv;
 
       let dirX: number;
       let dirY: number;
@@ -808,6 +1037,7 @@ export function stepPhaseExplosionsStage6(world: WorldState): void {
       e.vz += dirZ * dv;
       e.grounded = false;
       e.impulseTimer = 36;
+      if (e.kind === 'alien') applyEntityStun(room, e, 45, false, true);
     }
 
     // 2. 26 deterministic rays deduplicated by solid idx (8 T1 / 6 T2 / 0 T3, 3x if embrittled)
@@ -958,6 +1188,7 @@ export function stepEntityFluidSamplingStage8(world: WorldState): void {
     let touchCryo = false;
     let touchOil = false;
     let touchAcid = false;
+    let touchElectrified = false;
     let waterTemp: number = TEMP_BYTE.AMBIENT;
     let cryoX = -1;
     let cryoY = -1;
@@ -970,6 +1201,7 @@ export function stepEntityFluidSamplingStage8(world: WorldState): void {
       if (mat === MAT.WATER) {
         touchWater = true;
         waterTemp = getTempByte(val);
+        if (getTimerOrCharge(val) > 0) touchElectrified = true;
       } else if (mat === MAT.FIRE) {
         touchFire = true;
       } else if (mat === MAT.CRYO) {
@@ -981,6 +1213,7 @@ export function stepEntityFluidSamplingStage8(world: WorldState): void {
         touchOil = true;
       } else if (mat === MAT.ACID) {
         touchAcid = true;
+        if (getTimerOrCharge(val) > 0) touchElectrified = true;
       } else if (e.kind === 'crate' && getTempByte(val) >= TEMP_BYTE.WOOD_IGNITE) {
         touchFire = true;
       }
@@ -991,6 +1224,12 @@ export function stepEntityFluidSamplingStage8(world: WorldState): void {
 
     sampleCell(vx, vyFeet, vz);
     sampleCell(vx, vyTorso, vz);
+    const offX = Math.max(1, Math.floor((e.halfW * 0.72) / VOXEL_SIZE_M));
+    const offZ = Math.max(1, Math.floor((e.halfD * 0.72) / VOXEL_SIZE_M));
+    sampleCell(vx + offX, vyFeet, vz);
+    sampleCell(vx - offX, vyFeet, vz);
+    sampleCell(vx, vyFeet, vz + offZ);
+    sampleCell(vx, vyFeet, vz - offZ);
 
     if (touchWater) {
       e.wetTicks = 120;
@@ -1004,16 +1243,32 @@ export function stepEntityFluidSamplingStage8(world: WorldState): void {
       e.wetTicks--;
     }
 
-    if (touchFire && e.wetTicks === 0 && e.carapace !== 'thermal') {
+    const flameWeave = e.kind === 'player' && world.liningRank >= 2;
+    if (touchFire && e.wetTicks === 0 && e.carapace !== 'thermal' && !flameWeave) {
       e.burnTicks = 180;
     } else if (e.burnTicks > 0) {
       e.burnTicks--;
     }
 
     if (touchCryo) {
-      e.hp = Math.max(0, e.hp - 8 * FIXED_DT);
+      const frostInsul = e.kind === 'player' && world.liningRank >= 3;
+      e.hp = Math.max(0, e.hp - (frostInsul ? 4 : 8) * FIXED_DT);
       if (is15Hz) {
-        e.tempByte = Math.max(TEMP_BYTE.CRYO, e.tempByte - 3);
+        const minTemp = frostInsul ? TEMP_BYTE.EMBRITTLED + 1 : TEMP_BYTE.CRYO;
+        const wasFrozen = e.tempByte <= TEMP_BYTE.EMBRITTLED;
+        e.tempByte = Math.max(minTemp, e.tempByte - 5);
+        if (!wasFrozen && e.tempByte <= TEMP_BYTE.EMBRITTLED && e.kind === 'alien') {
+          pushCombatEvent(room, {
+            kind: 'shatter',
+            entityId: e.id,
+            x: e.x,
+            y: e.y + e.height + 0.15,
+            z: e.z,
+            value: 0,
+            colorHex: 0x7ef9ff,
+            label: 'FROZEN! (3x SHATTER)',
+          });
+        }
         if (cryoX >= 0) {
           const cIdx = cellIndex(cryoX, cryoY, cryoZ);
           const cVal = g[cIdx];
@@ -1035,8 +1290,42 @@ export function stepEntityFluidSamplingStage8(world: WorldState): void {
       e.hp = Math.max(0, e.hp - 20 * FIXED_DT);
     }
 
+    if (touchElectrified && e.carapace !== 'insulated') {
+      const lining3 = e.kind === 'player' && world.liningRank >= 3;
+      const armorConductMult = e.carapace === 'armored' ? 1.5 : 1.0;
+      const baseDps = (e.wetTicks > 0 ? 22.5 : 18.0) * armorConductMult;
+      const dps = lining3 ? baseDps * 0.5 : baseDps;
+      e.hp = Math.max(0, e.hp - dps * FIXED_DT);
+      e.shockTicks = 18;
+      if (world.simTick % 20 === 0) {
+        pushCombatEvent(room, {
+          kind: 'damage',
+          entityId: e.id,
+          x: e.x,
+          y: e.y + e.height,
+          z: e.z,
+          value: Math.round(dps * 0.33),
+          colorHex: 0x7ef9ff,
+          label: e.carapace === 'armored' ? `CONDUCT FRY! -${Math.round(dps * 0.33)}` : `SHOCK! -${Math.round(dps * 0.33)}`,
+        });
+      }
+      if (!lining3 && e.kind === 'alien') {
+        applyEntityStun(room, e, 45, false, true);
+      }
+    }
+
+    // Burning crates emit flames into adjacent air to ignite nearby oil & wood
+    if (e.kind === 'crate' && e.burnTicks > 0 && (world.simTick & 7) === 0) {
+      const fx = Math.floor(e.x / VOXEL_SIZE_M);
+      const fy = Math.floor((e.y + e.height + 0.05) / VOXEL_SIZE_M);
+      const fz = Math.floor(e.z / VOXEL_SIZE_M);
+      if (inRoomBounds(room, fx, fy, fz) && getMat(room.grid[cellIndex(fx, fy, fz)]) === MAT.AIR) {
+        writeCell(room, fx, fy, fz, packVoxel(MAT.FIRE, TEMP_BYTE.FIRE, 26, 0, world.simTick & 7), world.simTick);
+      }
+    }
     if (e.burnTicks > 0) {
-      e.hp = Math.max(0, e.hp - 12 * FIXED_DT);
+      const burnDps = touchFire ? 20 : 12;
+      e.hp = Math.max(0, e.hp - burnDps * FIXED_DT);
       // Burning crates ignite 1 adjacent OIL or WOOD_BARRIER cell per 15 Hz tick (§8.2)
       if (e.kind === 'crate' && is15Hz) {
         let ignited = false;

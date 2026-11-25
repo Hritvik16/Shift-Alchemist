@@ -167,6 +167,19 @@ export interface HazardEmitter {
   reserveL: number;
 }
 
+export interface ElectricPulseFrontier {
+  emitterId: number;
+  waveId: number; // >= 0 for room.emitters[i], -1 for transient Piezo-Arc pulses
+  originX: number;
+  originY: number;
+  originZ: number;
+  queueIdx: Int32Array;
+  queueScaled: Uint16Array;
+  head: number;
+  tail: number;
+  count: number;
+}
+
 export type ExplosionKind = 'steam' | 'cryo';
 
 export interface ExplosionWave {
@@ -188,8 +201,36 @@ export interface ExplosionVisualEvent {
   kind: ExplosionKind;
 }
 
+export type CombatVisualEventKind =
+  | 'damage'
+  | 'splat'
+  | 'shatter'
+  | 'kill'
+  | 'crate_break'
+  | 'vat_break'
+  | 'scrap'
+  | 'stun'
+  | 'interrupt';
+
+export interface CombatVisualEvent {
+  kind: CombatVisualEventKind;
+  entityId: number;
+  x: number;
+  y: number;
+  z: number;
+  value: number;
+  colorHex: number;
+  label: string;
+}
+
+export type DoorFace = 'N' | 'S' | 'E' | 'W';
+
+export type ShiftSetpieceId = 'flooded_sump' | 'split_chasm' | 'ceiling_vats';
+export type AlchemySetpieceId = 'tinderbox_loft' | 'tesla_pit' | 'cryo_spillway' | 'fuel_choke';
+export type SetpieceId = ShiftSetpieceId | AlchemySetpieceId;
+
 export interface DoorRecord {
-  face: 'N' | 'S' | 'E' | 'W';
+  face: DoorFace;
   minX: number;
   maxX: number;
   minY: number;
@@ -197,6 +238,30 @@ export interface DoorRecord {
   minZ: number;
   maxZ: number;
   locked: boolean;
+  targetRoomId: number | null;
+  targetFace: DoorFace | null;
+  isExtraction: boolean;
+}
+
+export interface WorkbenchTerminalAnchor {
+  index: 0 | 1 | 2 | 3;
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface RoomWorkbenchState {
+  patchBought: boolean;
+  nonPatchCount: number;
+  terminalPurchases: [number, number, number, number];
+}
+
+export function createDefaultWorkbenchState(): RoomWorkbenchState {
+  return {
+    patchBought: false,
+    nonPatchCount: 0,
+    terminalPurchases: [0, 0, 0, 0],
+  };
 }
 
 export interface ConservationLedgers {
@@ -251,7 +316,13 @@ export interface SerializedBallisticRecord {
 }
 
 export interface RoomState {
+  roomId: number;
   roomSeed: number;
+  setpieces: SetpieceId[];
+  cleared: boolean;
+  workbenchAlcoveIndex: 0 | 1 | 2;
+  workbenchTerminals: WorkbenchTerminalAnchor[];
+  workbenchState: RoomWorkbenchState;
   roomW: number;
   roomH: number;
   roomD: number;
@@ -287,11 +358,20 @@ export interface RoomState {
   sublimationEvents: Float32Array;
   sublimationEventCount: number;
   emitters: HazardEmitter[];
+  electricFrontiers: ElectricPulseFrontier[];
+  bfsRoundRobinCursor: number;
+  bfsWaveCounter: number;
+  bfsVisitedStamp: Uint32Array;
+  chargedCells: Int32Array;
+  chargedCellsCount: number;
+  chargedBitset: Uint32Array;
   explosionQueue: ExplosionWave[];
   recentExplosions: ExplosionVisualEvent[];
+  combatEvents: CombatVisualEvent[];
   vats: VatRecord[];
   doors: DoorRecord[];
   ledgers: ConservationLedgers;
+  entitiesRef?: readonly { readonly glands: readonly { readonly mat: MaterialId; readonly liters: number }[] }[];
 }
 
 export function createBallisticPool(): BallisticPool {
@@ -328,7 +408,13 @@ export function createDeferredFluidQueue(): DeferredFluidQueue {
 
 export function createEmptyRoomState(roomSeed = 1): RoomState {
   return {
+    roomId: 0,
     roomSeed: roomSeed >>> 0,
+    setpieces: [],
+    cleared: false,
+    workbenchAlcoveIndex: 0,
+    workbenchTerminals: [],
+    workbenchState: createDefaultWorkbenchState(),
     roomW: ARENA_W,
     roomH: ARENA_H,
     roomD: ARENA_D,
@@ -364,8 +450,16 @@ export function createEmptyRoomState(roomSeed = 1): RoomState {
     sublimationEvents: new Float32Array(128 * 3),
     sublimationEventCount: 0,
     emitters: [],
+    electricFrontiers: [],
+    bfsRoundRobinCursor: 0,
+    bfsWaveCounter: 0,
+    bfsVisitedStamp: new Uint32Array(ARENA_CELLS),
+    chargedCells: new Int32Array(16_384),
+    chargedCellsCount: 0,
+    chargedBitset: new Uint32Array(BITSET_WORDS),
     explosionQueue: [],
     recentExplosions: [],
+    combatEvents: [],
     vats: [],
     doors: [],
     ledgers: {
@@ -414,8 +508,15 @@ export function resetRoomRuntimeTransient(room: RoomState): void {
   room.deferredFluid.count = 0;
   room.pendingVatShatters.length = 0;
   room.sublimationEventCount = 0;
+  room.electricFrontiers.length = 0;
+  room.bfsRoundRobinCursor = 0;
+  room.bfsWaveCounter = 0;
+  room.bfsVisitedStamp.fill(0);
+  room.chargedCellsCount = 0;
+  room.chargedBitset.fill(0);
   room.explosionQueue.length = 0;
   room.recentExplosions.length = 0;
+  room.combatEvents.length = 0;
 }
 
 export function inRoomBounds(room: RoomState, x: number, y: number, z: number): boolean {
@@ -613,6 +714,24 @@ export function markCellDirty(
   wake6Neighbors(room, x, y, z, simTick);
 }
 
+export function trackChargedCell(room: RoomState, idx: number, val: number): void {
+  if (((val >>> 16) & 0x3f) === 0) return;
+  const cm = val & 0x1f;
+  if (
+    cm === MAT.WATER ||
+    cm === MAT.ACID ||
+    cm === MAT.HULL_STEEL ||
+    cm === MAT.STEEL_GRATE
+  ) {
+    const cw = idx >>> 5;
+    const cb = 1 << (idx & 31);
+    if ((room.chargedBitset[cw] & cb) === 0 && room.chargedCellsCount < room.chargedCells.length) {
+      room.chargedBitset[cw] |= cb;
+      room.chargedCells[room.chargedCellsCount++] = idx;
+    }
+  }
+}
+
 export function writeCell(
   room: RoomState,
   x: number,
@@ -630,6 +749,7 @@ export function writeCell(
   }
   if (oldVal === finalVal) return;
   room.grid[idx] = finalVal;
+  trackChargedCell(room, idx, room.grid[idx]);
   markCellDirty(room, x, y, z, oldVal, finalVal, simTick);
 }
 
@@ -652,6 +772,7 @@ export function moveCell(
 
   room.grid[sIdx] = airVal;
   room.grid[dIdx] = movedVal;
+  trackChargedCell(room, dIdx, movedVal);
 
   markCellDirty(room, sx, sy, sz, srcVal, airVal, simTick);
   markCellDirty(room, dx, dy, dz, oldDstVal, movedVal, simTick);
@@ -677,6 +798,8 @@ export function swapCells(
 
   room.grid[aIdx] = newA;
   room.grid[bIdx] = newB;
+  trackChargedCell(room, aIdx, newA);
+  trackChargedCell(room, bIdx, newB);
 
   markCellDirty(room, ax, ay, az, oldA, newA, simTick);
   markCellDirty(room, bx, by, bz, oldB, newB, simTick);
@@ -722,7 +845,7 @@ export function transitionCell(
     slideDir = hash32(room.roomSeed, simTick, idx) & 3;
   } else if (newMat === MAT.FIRE) {
     temp = TEMP_BYTE.FIRE;
-    timerOrCharge = 30;
+    timerOrCharge = 54;
   } else if (newMat === MAT.AIR) {
     temp = TEMP_BYTE.AMBIENT;
     shimmer = 0;
@@ -804,6 +927,16 @@ export function applyStructuralDamage(
     transitionCell(room, x, y, z, MAT.AIR, TEMP_BYTE.AMBIENT, simTick);
     if (mat === MAT.GLASS_VAT) {
       room.pendingVatShatters.push(idx);
+      pushCombatEvent(room, {
+        kind: 'vat_break',
+        entityId: -1,
+        x: (x + 0.5) * VOXEL_SIZE_M,
+        y: (y + 0.5) * VOXEL_SIZE_M,
+        z: (z + 0.5) * VOXEL_SIZE_M,
+        value: 0,
+        colorHex: 0x8ef0ff,
+        label: '',
+      });
     }
     return true;
   }
@@ -924,7 +1057,7 @@ export function raycastSolidVoxel(
   for (let steps = 0; steps < 1024 && t <= tMax; steps++) {
     if (inRoomBounds(room, x, y, z)) {
       const isCeilingCutaway = y >= room.roomH - 2;
-      const isSECutaway = (x === room.roomW - 1 || z === room.roomD - 1) && y >= 8;
+      const isSECutaway = (x === room.roomW - 1 || z === room.roomD - 1) && y >= (room.roomH >= 64 ? 15 : 6);
       if (!skipVisualCutaway || (!isCeilingCutaway && !isSECutaway)) {
         const mat = getMat(room.grid[cellIndex(x, y, z)]);
         if (isSolidMat(mat)) {
@@ -1051,6 +1184,28 @@ export function recomputeRoomLedgers(room: RoomState, playerTank?: TankLedgerVie
     }
   }
 
+  const ents = room.entitiesRef;
+  if (ents) {
+    for (let i = 0; i < ents.length; i++) {
+      const glands = ents[i].glands;
+      for (let gIdx = 0; gIdx < glands.length; gIdx++) {
+        const gl = glands[gIdx];
+        if (gl.liters <= 0) continue;
+        if (gl.mat === MAT.WATER) water += gl.liters;
+        else if (gl.mat === MAT.OIL) oil += gl.liters;
+        else if (gl.mat === MAT.CRYO) cryo += gl.liters;
+        else if (gl.mat === MAT.ACID) acid += gl.liters;
+      }
+    }
+  }
+
+  for (let i = 0; i < room.emitters.length; i++) {
+    const em = room.emitters[i];
+    if (em.kind === 'cryo_pipe' && em.reserveL > 0) {
+      cryo += em.reserveL;
+    }
+  }
+
   room.ledgers.water = water;
   room.ledgers.oil = oil + room.ledgers.oilCombusted;
   room.ledgers.cryo = cryo + room.ledgers.cryoBoiledOff;
@@ -1096,5 +1251,11 @@ export function queuePhaseExplosion(
     q.push({ x: xM, y: yM, z: zM, playerOnly, intensity: 1, kind });
   } else if (nearestIdx >= 0) {
     if (q[nearestIdx].intensity < 8) q[nearestIdx].intensity++;
+  }
+}
+
+export function pushCombatEvent(room: RoomState, ev: CombatVisualEvent): void {
+  if (room.combatEvents.length < 48) {
+    room.combatEvents.push(ev);
   }
 }

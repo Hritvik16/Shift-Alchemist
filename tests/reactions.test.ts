@@ -6,9 +6,9 @@ import {
   MAT,
   MAX_EXPLOSION_QUEUE,
   TEMP_BYTE,
-} from './balance.ts';
-import { stepWorldTick } from './physics.ts';
-import { generateCargoHold } from './roomGen.ts';
+} from '../src/core/balance.ts';
+import { stepWorldTick } from '../src/core/physics.ts';
+import { generateCargoHold } from '../src/core/roomGen.ts';
 import {
   cellIndex,
   getDamage,
@@ -18,13 +18,13 @@ import {
   queuePhaseExplosion,
   recomputeRoomLedgers,
   writeCell,
-} from './types.ts';
+} from '../src/core/types.ts';
 import {
   createBroodPodEntity,
   createEmptyInput,
   createWorldState,
   type WorldState,
-} from './world.ts';
+} from '../src/core/world.ts';
 
 function makeWorld(seed = 2201): WorldState {
   const world = createWorldState(seed);
